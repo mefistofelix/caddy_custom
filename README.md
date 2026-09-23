@@ -3,12 +3,15 @@
 Custom Caddy build with caddy-l4, forwardproxy, YAML support, and the local
 proxy_cache and var_file modules.
 
-Run `bash ./build.sh` on Linux x64 to build both binaries with Go 1.24.3:
+Run `bash ./build.sh` on Linux x64 to build both binaries with Go 1.27.1:
 
 - `bin/caddy-linux-amd64`
 - `bin/caddy-windows-amd64.exe`
 
-The build uses the versions recorded in `caddy/go.mod` and `caddy/go.sum`.
+`caddy/go.mod.initial` is the source of truth for dependency versions. Each build
+copies it to `caddy/go.mod` and runs `go mod tidy` before compiling. Only direct
+dependencies are listed in `go.mod.initial`; generated `go.mod` and `go.sum`
+files are not tracked in Git.
 Run the `ci` workflow manually from GitHub Actions to build and publish both
 binaries in a release named after the first 12 characters of the commit SHA.
 

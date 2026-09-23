@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-go_version=1.24.3
+go_version=1.27.1
 go_dir="$script_dir/build/go$go_version"
 
 # Run on Linux x64; cross-compile both release binaries with the same toolchain.
@@ -16,6 +16,9 @@ fi
 export CGO_ENABLED=0
 export GOARCH=amd64
 export GOTOOLCHAIN=local
+
+cp "$script_dir/caddy/go.mod.initial" "$script_dir/caddy/go.mod"
+"$go_dir/bin/go" -C "$script_dir/caddy" mod tidy
 
 mkdir -p "$script_dir/bin"
 for target in linux windows; do

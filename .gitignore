@@ -2,3 +2,5 @@
 /bin/
 /caddy/bin/
 /caddy_data/
+/caddy/go.mod
+/caddy/go.sum

@@ -1,12 +1,16 @@
 module caddy
 
-go 1.24
+go 1.27.1
 
-require github.com/caddyserver/caddy/v2 v2
-replace github.com/caddyserver/caddy/v2 => github.com/caddyserver/caddy/v2 a76d005
+require (
+	github.com/abiosoft/caddy-yaml v0.0.0-20210522210701-64fbdd07cf02
+	github.com/caddyserver/caddy/v2 v2.11.4
+	github.com/caddyserver/forwardproxy v0.0.0-20260321230143-0aab84dad4fc
+	github.com/ducktype/caddy_proxy_cache v0.0.0
+	github.com/ducktype/caddy_var_file v0.0.0
+	github.com/mholt/caddy-l4 v0.1.2
+)
 
-require github.com/ducktype/caddy_proxy_cache v0.0.0
 replace github.com/ducktype/caddy_proxy_cache => ../caddy_proxy_cache
 
-require github.com/ducktype/caddy_var_file v0.0.0
 replace github.com/ducktype/caddy_var_file => ../caddy_var_file
