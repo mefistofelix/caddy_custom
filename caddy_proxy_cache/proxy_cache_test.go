@@ -464,3 +464,250 @@ func TestFinalHeadersAndBypass(t *testing.T) {
 		}
 	}
 }
+
+func TestStorageAndCELConfiguration(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	t.Setenv("CACHE_TEST_DIR", t.TempDir())
+	m := newTestCache(t)
+	config := "proxy_cache {\n methods GET HEAD POST\n storage_path {env.CACHE_TEST_DIR}\n key {http.request.host}/{http.vars.root_name}\n bypass {http.request.header.X-Skip} == \"yes\"\n inactive 10m\n max_age 0\n wait_timeout 600s\n}"
+	if err := m.UnmarshalCaddyfile(caddyfile.NewTestDispenser(config)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Cleanup()
+	if m.cache_dir != os.Getenv("CACHE_TEST_DIR") || m.MaxAge == nil || *m.MaxAge != 0 || *m.WaitTimeout != caddy.Duration(600*time.Second) || m.Inactive != caddy.Duration(10*time.Minute) {
+		t.Fatalf("configuration: %+v", m)
+	}
+	calls := 0
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls++
+		_, err := fmt.Fprint(w, calls)
+		return err
+	})
+	for _, tc := range []struct{ skip, want string }{{"", "1"}, {"yes", "2"}, {"", "1"}} {
+		w, err := perform(m, request(http.Header{"X-Skip": {tc.skip}}), next)
+		if err != nil || w.Body.String() != tc.want {
+			t.Fatalf("CEL bypass: body=%q err=%v", w.Body.String(), err)
+		}
+	}
+	if len(files(t, m)) != 1 {
+		t.Fatal("bypassed response was stored")
+	}
+	for _, expr := range []string{"not valid CEL ?", "42"} {
+		x := newTestCache(t)
+		x.StoragePath = x.cache_dir
+		x.Bypass = &caddyhttp.MatchExpression{Expr: expr}
+		if err := x.Provision(ctx); err == nil {
+			x.Cleanup()
+			t.Fatalf("accepted expression %q", expr)
+		}
+	}
+	x := newTestCache(t)
+	x.StoragePath = x.cache_dir
+	x.Bypass = &caddyhttp.MatchExpression{Expr: `int({http.request.header.Number}) > 0`}
+	if err := x.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer x.Cleanup()
+	if _, err := perform(x, request(nil), next); err == nil {
+		t.Fatal("ignored CEL evaluation error")
+	}
+	for _, option := range []string{"wait_timeout 0", "inactive -1s", "max_age -1s", "key one two", "storage_path one two", "methods"} {
+		if err := new(ProxyCache).UnmarshalCaddyfile(caddyfile.NewTestDispenser("proxy_cache {\n" + option + "\n}")); err == nil {
+			t.Fatalf("accepted %q", option)
+		}
+	}
+}
+
+func bodyRequest(method, body string) *http.Request {
+	r := request(nil)
+	r.Method, r.Body, r.ContentLength = method, io.NopCloser(strings.NewReader(body)), int64(len(body))
+	return r
+}
+
+func TestMethodsBodiesAndCustomKey(t *testing.T) {
+	m := newTestCache(t)
+	m.Methods = []string{"POST"}
+	calls := 0
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "%s/%s", r.Method, body)
+		return err
+	})
+	for _, body := range []string{"a", "b", "a", "b"} {
+		w, err := perform(m, bodyRequest("POST", body), next)
+		if err != nil || w.Body.String() != "POST/"+body {
+			t.Fatalf("request body: %q %v", w.Body.String(), err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("body variants: calls=%d", calls)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := perform(m, bodyRequest("GET", ""), next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 4 {
+		t.Fatal("methods did not exclude GET")
+	}
+	m = newTestCache(t)
+	m.Key = "{http.vars.tenant}/{http.request.uri.path}"
+	calls = 0
+	next = caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls++
+		_, err := fmt.Fprint(w, calls)
+		return err
+	})
+	for _, tc := range []struct{ tenant, query, header, want string }{{"one", "a=1", "en", "1"}, {"one", "a=2", "it", "1"}, {"two", "a=1", "en", "2"}} {
+		r := request(http.Header{"Accept-Language": {tc.header}})
+		r.URL.RawQuery = tc.query
+		caddyhttp.SetVar(r.Context(), "tenant", tc.tenant)
+		w, err := perform(m, r, next)
+		if err != nil || w.Body.String() != tc.want {
+			t.Fatalf("custom key: %q %v", w.Body.String(), err)
+		}
+	}
+	m.Key = "{unknown.placeholder}"
+	if _, err := perform(m, request(nil), next); err == nil {
+		t.Fatal("unknown placeholder silently collapsed key")
+	}
+}
+
+func TestRetentionAndAccessTime(t *testing.T) {
+	for _, mode := range []string{"read", "cleanup"} {
+		for _, tc := range []struct {
+			name                              string
+			idle, maxAge, birthAge, accessAge time.Duration
+			retained                          bool
+		}{
+			{"idle-expired", 10 * time.Minute, 2 * time.Hour, time.Hour, 20 * time.Minute, false},
+			{"absolute-expired", 10 * time.Minute, time.Hour, 2 * time.Hour, time.Second, false},
+			{"access-extends-retention", 10 * time.Minute, 0, 48 * time.Hour, time.Minute, true},
+			{"no-touch", 0, time.Hour, 5 * time.Minute, 2 * time.Hour, true},
+			{"both-disabled", 0, 0, 48 * time.Hour, 48 * time.Hour, true},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				m := newTestCache(t)
+				m.Inactive = caddy.Duration(tc.idle)
+				age := caddy.Duration(tc.maxAge)
+				m.MaxAge = &age
+				calls := 0
+				next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+					calls++
+					_, err := fmt.Fprint(w, calls)
+					return err
+				})
+				if _, err := perform(m, request(nil), next); err != nil {
+					t.Fatal(err)
+				}
+				path := files(t, m)[0]
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				parts := strings.SplitN(string(data), " ", 5)
+				parts[1] = strconv.FormatInt(time.Now().Add(-tc.birthAge).UnixNano(), 10)
+				if err := os.WriteFile(path, []byte(strings.Join(parts, " ")), 0600); err != nil {
+					t.Fatal(err)
+				}
+				access := time.Now().Add(-tc.accessAge)
+				if err := os.Chtimes(path, access, access); err != nil {
+					t.Fatal(err)
+				}
+				before, _ := os.Stat(path)
+				if mode == "cleanup" {
+					m.cleanCache()
+					if (len(files(t, m)) == 1) != tc.retained {
+						t.Fatal("incorrect retention cleanup")
+					}
+					return
+				}
+				w, err := perform(m, request(nil), next)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := "2"
+				if tc.retained {
+					want = "1"
+				}
+				if w.Body.String() != want {
+					t.Fatalf("retention lookup: %q", w.Body.String())
+				}
+				if !tc.retained {
+					return
+				}
+				after, _ := os.Stat(path)
+				if tc.idle == 0 && !after.ModTime().Equal(before.ModTime()) {
+					t.Fatal("mtime changed with inactive disabled")
+				}
+				if tc.idle > 0 && !after.ModTime().After(before.ModTime()) {
+					t.Fatal("last access was not updated")
+				}
+				seconds, _ := strconv.ParseInt(w.Header().Get("Age"), 10, 64)
+				if seconds < int64(tc.birthAge/time.Second) {
+					t.Fatalf("Age reset by access: %d", seconds)
+				}
+			})
+		}
+	}
+}
+
+func TestWaitTimeoutPreservesBodyAndCleansPrivateFill(t *testing.T) {
+	m := newTestCache(t)
+	m.Methods = []string{"POST"}
+	timeout := caddy.Duration(30 * time.Millisecond)
+	m.WaitTimeout = &timeout
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			w.Header().Set("Set-Cookie", "private=1")
+		}
+		_, err = fmt.Fprintf(w, "body=%s", body)
+		return err
+	})
+	results := make(chan error, 2)
+	run := func() {
+		w, err := perform(m, bodyRequest("POST", "payload"), next)
+		if err == nil && w.Body.String() != "body=payload" {
+			err = fmt.Errorf("lost body: %q", w.Body.String())
+		}
+		results <- err
+	}
+	go run()
+	<-started
+	go run()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(2 * time.Second):
+			close(release)
+			t.Fatal("configured wait timeout ignored")
+		}
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for len(files(t, m)) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(files(t, m)) != 0 || calls.Load() != 3 {
+		t.Fatalf("fill leaked or fallback missing: files=%v calls=%d", files(t, m), calls.Load())
+	}
+}

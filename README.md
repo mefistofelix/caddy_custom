@@ -242,12 +242,60 @@ content by site. The implementation remains in `caddy_proxy_cache/proxy_cache.go
 
 ```caddyfile
 proxy_cache {
-    valid 200 301 302 303 307 308 5m
-    valid 404 30s
-    # Optional overrides, only when appropriate for the upstream:
-    # ignore_headers Cache-Control Expires
+    methods GET HEAD
+    storage_path /var/cache/caddy
+    valid 200 404 301 302 303 307 5m
+    ignore_headers Cache-Control Expires Set-Cookie
+    bypass `!({http.request.cookie.nocache} in ["", "0"]) || !({http.request.header.X-NoCache} in ["", "0"]) || !({http.request.uri.query.nocache} in ["", "0"]) || {http.request.header.Authorization} != ""`
+    inactive 720h
+    max_age 2160h
+    wait_timeout 600s
 }
 ```
+
+This example uses the earlier Nginx-style response policy, thirty-day inactivity
+retention, and a ninety-day absolute cap. Bare `proxy_cache` retains the defaults
+below; these settings are not all required.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `methods METHOD ...` | `GET HEAD` | Exact, case-sensitive allowlist; replaces the default list. |
+| `storage_path path` | `caddy.AppDataDir()/proxy_cache` | Dedicated cache directory for this middleware instance. Relative paths resolve from the process working directory; global placeholders such as `{env.CACHE_DIR}` are resolved at provisioning. Request placeholders are not supported here. Temporary files stay beside the final entry for rename. |
+| `key template` | Built-in key described below | Request-time Caddy placeholder template, replacing the default key. |
+| `bypass expression` | Authorization present or any implemented `nocache` signal exactly `1` | Caddy CEL request matcher, compiled at provisioning. `true` skips both reading and writing the cache. An explicit expression replaces this default bypass policy. |
+| `inactive duration` | `0` (disabled) | Retention limit since the last cache access, tracked using file modification time. |
+| `max_age duration` | `1h` | Absolute retention limit since response capture started, independent of accesses; `0` disables it. |
+| `wait_timeout duration` | `5m` | Positive maximum wait for a missing entry, also used as the background refresh timeout. |
+
+Both retention limits are checked on reads and by the cleaner. When either
+enabled limit expires, the entry cannot be served, even stale. A successful
+refresh creates a new entry and starts its retention clocks again. Only an
+enabled `inactive` causes cache reads to update mtime. Creation time and policy
+durations are stored in the file, so touching it cannot extend `max_age`, change
+response freshness, or reset `Age`. Entries sharing a storage directory retain
+their own stored limits when another middleware instance runs cleanup.
+
+For example, an explicit key can use:
+
+```caddyfile
+key "{http.request.scheme}|{http.request.method}|{http.request.host}|{http.request.orig_uri}|{http.request.header.Cookie}|{http.request.header.Accept-Language}"
+```
+
+An explicit key controls the request dimensions: automatic header and body
+digests are no longer appended. Include every relevant cookie, authorization,
+body, and `Vary` dimension yourself. `{http.request.body_hash}` provides the MD5
+digest of the buffered request body for key templates. The document-root
+namespace and response/retention policy fingerprint remain separate guards.
+Unknown key placeholders cause an error rather than silently collapsing keys.
+Caddyfile shorthand placeholders are expanded by Caddy's adapter; JSON uses
+their full names.
+
+CEL supports Caddy's request placeholders and matcher functions. Quote the entire
+expression with backticks, or use ordinary unquoted CEL syntax. Configuration
+errors fail provisioning; runtime evaluation errors return an error without
+serving or populating the cache. For example, `bypass false` disables the default
+Authorization/nocache bypass, so the key must then separate authenticated users.
+Range and Upgrade requests always bypass independently of CEL.
 
 The configuration borrows the relevant semantics of Nginx's
 [`proxy_cache_valid`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_valid)
@@ -276,20 +324,22 @@ cached responses also account for time on disk in `Age`.
 
 ### Request flow
 
-1. Allows only `GET` and `HEAD`. Bypasses caching when `Authorization` or `Range`
-   is present, or the `nocache` query parameter, `nocache` cookie, or `X-NoCache`
-   header equals exactly `1`. Requests with a body or `Upgrade` also bypass it.
+1. Checks the method allowlist, the bypass policy, Range, and Upgrade. Request
+   bodies for eligible requests are buffered in memory and given independent
+   readers for the fill and any timeout fallback; configured methods such as
+   POST can therefore be cached without consuming another request's body.
 2. Builds a key from the document root, method, TLS presence, HTTP version, host,
-   original URI including its query, and a digest of all request headers. Cookies
+   original URI including its query, and digests of all request headers and the
+   body, unless an explicit `key` replaces these dimensions. By default, cookies
    and all header-based `Vary` dimensions are therefore separated **before**
    singleflight, including on the first miss. This deliberately separates more
    variants than `Vary` requires; changing irrelevant headers also reduces hits.
    The configured policy is included so changing overrides does not reuse entries
    written under the previous policy.
-3. Looks under `caddy.AppDataDir()/proxy_cache/<md5-root>/<md5-key>`. MD5 is used
+3. Looks under `<storage_path>/<md5-root>/<md5-key>`. MD5 is used
    for filenames, not encryption or data protection.
 4. On a missing entry, waits for the next middleware's response and uses
-   `singleflight` to coalesce updates of that exact key. Other keys run
+   `singleflight` to coalesce updates of that exact cache path. Other keys run
    independently. An uncacheable response belongs only to its initiating request;
    waiting requests call the next middleware independently rather than sharing it.
 5. On an expired entry, serves the existing copy while updating in the background.
@@ -302,33 +352,36 @@ cached responses also account for time on disk in `Age`.
    temporarily spooled for their owner, then removed after replay. Incomplete
    responses and failed refreshes do not replace an existing entry.
 
-Cache metadata includes the response expiry. Older-format entries are refilled.
+Cache metadata includes response expiry, creation time, and both retention
+durations. Older-format entries are refilled. After timeout or cancellation,
+an abandoned private fill is removed when the producer finishes.
 
 | Source setting | Value |
 | --- | --- |
 | Default response freshness | 300 seconds; configurable and overridden by response freshness headers |
-| Maximum wait for a missing entry | 300 seconds, then calls the next middleware directly |
-| Background refresh timeout | 300 seconds |
-| Cleanup interval | 30 seconds after each cleanup pass |
-| File age eligible for cleanup | More than 60 minutes since modification |
+| Maximum wait for a missing entry | `wait_timeout`, then calls the next middleware directly without caching that fallback |
+| Background refresh timeout | `wait_timeout` |
+| Cleanup interval | 30 seconds; stops when the module is cleaned up |
+| File age eligible for cleanup | Either enabled retention limit has expired; abandoned temporary files older than one hour are also removed |
 | Cleanup limit | 200 candidate files per pass |
 
 ### Current limitations
 
 - This remains a small response cache, not a complete RFC cache or an Nginx
-  reimplementation. There is no conditional revalidation, purge API, configurable
-  cache key, or general expression language for bypass rules. Existing stale
+  reimplementation. There is no conditional revalidation or purge API. Existing stale
   serving remains enabled; `must-revalidate` and request cache directives do not
   change that behavior.
 - Personalization using information outside the key, such as the peer address,
   still needs an explicit bypass. Matching cookies alone do not guarantee that
   content is suitable for caching; the upstream should emit the appropriate
   response policy.
-- Cleanup still removes files older than one hour, even with longer configured
-  TTLs. Cleanup and filesystem failure recovery remain basic.
+- Cleanup and filesystem failure recovery remain basic. A storage directory
+  should be dedicated to cache files. Request-body buffering consumes memory
+  proportional to the body size.
 - Cache files include response bodies, metadata, URLs, user agents, and the peer
-  address/port (`RemoteAddr`). Debug logs also include Authorization values for
-  requests that subsequently bypass the cache. Do not commit real cache or log data.
+  address/port (`RemoteAddr`). If an explicit bypass policy permits authenticated
+  requests, debug logs and default-key metadata can include Authorization values.
+  Do not commit real cache or log data.
 
 ## Local module: var_file
 
@@ -352,7 +405,8 @@ After building, check the local packages with:
 
 `caddy_proxy_cache/proxy_cache_test.go` exercises response policy, configuration,
 misses/hits, independent cookie and Vary variants, concurrent fills, private
-responses, stale refresh, bypasses, and incomplete upstream responses through
+responses, stale refresh, CEL bypass, custom keys and storage, request bodies,
+retention clocks, wait timeouts, and incomplete upstream responses through
 in-process HTTP handlers. The other local module has no tests.
 
 For cache concurrency changes, use the race detector on a host with a C compiler:

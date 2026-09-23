@@ -17,6 +17,7 @@ import "strconv"
 import "strings"
 import "context"
 import "maps"
+import "bytes"
 
 import "golang.org/x/sync/singleflight"
 
@@ -173,13 +174,30 @@ func (rww *ResponseWriterWrapper) ReadFrom(r io.Reader) (n int64, err error) {
 //--------------------------------------------------------------------------------
 
 type ProxyCache struct {
+	Methods []string `json:"methods,omitempty"`
+	StoragePath string `json:"storage_path,omitempty"`
+	Key string `json:"key,omitempty"`
+	Bypass *caddyhttp.MatchExpression `json:"bypass,omitempty"`
+	Inactive caddy.Duration `json:"inactive,omitempty"`
+	MaxAge *caddy.Duration `json:"max_age,omitempty"`
+	WaitTimeout *caddy.Duration `json:"wait_timeout,omitempty"`
 	Valid map[string]caddy.Duration `json:"valid,omitempty"`
 	IgnoreHeaders []string `json:"ignore_headers,omitempty"`
 	ctx context.Context
 	logger *zap.Logger
 	sfg *singleflight.Group
 	cache_dir string
-	clean_timer *time.Timer
+	cancel context.CancelFunc
+}
+
+// Freshness and absolute age never use mtime: it optionally tracks last access.
+type cacheStamp struct { expires, created, maxAge, inactive int64 }
+func readStamp(line string) (s cacheStamp) {
+	if n, _ := fmt.Sscan(line, &s.expires, &s.created, &s.maxAge, &s.inactive); n != 4 { return cacheStamp{} }
+	return s
+}
+func (s cacheStamp) retained(info fs.FileInfo) bool {
+	return info != nil && s.created > 0 && s.expires > 0 && (s.maxAge == 0 || time.Since(time.Unix(0,s.created)) < time.Duration(s.maxAge)) && (s.inactive == 0 || time.Since(info.ModTime()) < time.Duration(s.inactive))
 }
 
 //----------------------------------------------------------------------------------------
@@ -207,21 +225,23 @@ func (ProxyCache) CaddyModule() caddy.ModuleInfo {
 }
 
 func (m *ProxyCache) Provision(ctx caddy.Context) error {
-	m.ctx = ctx
+	m.ctx, m.cancel = context.WithCancel(ctx)
 	m.logger = ctx.Logger()
 	//defer m.logger.Sync()
 	//var log = m.logger.Sugar()
 	//log.Debugln("Provision")
-	m.cache_dir = filepath.Join(caddy.AppDataDir(),"proxy_cache")
+	if m.Inactive < 0 || (m.MaxAge != nil && *m.MaxAge < 0) || (m.WaitTimeout != nil && *m.WaitTimeout <= 0) { return fmt.Errorf("TTL must be non-negative and wait_timeout positive") }
+	if m.Bypass != nil { if err := m.Bypass.Provision(ctx); err != nil { return err } }
+	path := m.StoragePath; if path == "" { path = filepath.Join(caddy.AppDataDir(),"proxy_cache") }
+	var err error; path, err = caddy.NewReplacer().ReplaceOrErr(path, true, true); if err != nil { return err }
+	m.cache_dir, err = filepath.Abs(path); if err != nil { return err }
 	//os.MkdirAll(m.cache_dir, 0644) //@error handling
-	go m.cleanCache()
+	go func() { ticker := time.NewTicker(30*time.Second); defer ticker.Stop(); for { m.cleanCache(); select { case <-m.ctx.Done(): return; case <-ticker.C: } } }()
 	return nil
 }
 
 func (m *ProxyCache) Cleanup() error {
-	if m.clean_timer != nil {
-		m.clean_timer.Stop()
-	}
+	if m.cancel != nil { m.cancel() }
 	return nil
 }
 
@@ -229,25 +249,12 @@ func (m *ProxyCache) cleanCache() {
 	defer m.logger.Sync()
 	var log = m.logger.Sugar()
 
-	var clean_timer_sec = 30
 	var max_files_delete = 200
-	var max_file_ttl_mins = 60
 	
 	var num_del = 0
-	var now = time.Now()
 	filepath.WalkDir(m.cache_dir, func (s string, f fs.DirEntry, err error) error {
 		if err != nil {
 		  return nil
-		}
-		if f.IsDir() {
-			var ff, _ = os.Open(s)
-			if ff != nil {
-				var files, _ = ff.Readdir(3)
-				if len(files)<=2 {
-					log.Debugln("clean cache dir: ",s)
-					os.Remove(s)
-				}
-			}
 		}
 		if !f.Type().IsRegular() {
 			return nil
@@ -256,11 +263,11 @@ func (m *ProxyCache) cleanCache() {
 		if finfo == nil {
 			return nil
 		}
-		var exptime = finfo.ModTime().Add(time.Duration(max_file_ttl_mins) * time.Minute)
-		var is_expired = now.After(exptime)
-    if !is_expired {
-    	return nil
-    }
+		if strings.HasPrefix(f.Name(), ".response-") { if time.Since(finfo.ModTime()) < time.Hour { return nil } } else {
+			if _, err := hex.DecodeString(f.Name()); err != nil || len(f.Name()) != 32 { return nil }
+			fd, err := os.Open(s); if err != nil { return nil }; line, _ := bufio.NewReader(fd).ReadString('\n'); fd.Close()
+			if readStamp(line).retained(finfo) { return nil }
+		}
     log.Debugln("clean cache file: ",s)
     os.Remove(s)
 		num_del += 1
@@ -270,7 +277,6 @@ func (m *ProxyCache) cleanCache() {
 		return nil
 	})
 	
-	m.clean_timer = time.AfterFunc(time.Duration(clean_timer_sec) * time.Second, m.cleanCache)
 }
 
 //------------------------------------------------------------------------------
@@ -279,9 +285,16 @@ func (m *ProxyCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
 	if d.NextArg() { return d.ArgErr() }
 	for d.NextBlock(0) {
+		if d.Val() == "bypass" { m.Bypass = new(caddyhttp.MatchExpression); if err := m.Bypass.UnmarshalCaddyfile(d.NewFromNextSegment()); err != nil { return err }; continue }
 		name, args := d.Val(), d.RemainingArgs()
 		if len(args) == 0 { return d.ArgErr() }
 		switch name {
+		case "methods": m.Methods = args
+		case "storage_path", "key":
+			if len(args) != 1 { return d.ArgErr() }; if name == "key" { m.Key = args[0] } else { m.StoragePath = args[0] }
+		case "inactive", "max_age", "wait_timeout":
+			if len(args) != 1 { return d.ArgErr() }; ttl, err := caddy.ParseDuration(args[0]); if err != nil || ttl < 0 || (name == "wait_timeout" && ttl == 0) { return d.Err("invalid cache duration") }
+			value := caddy.Duration(ttl); switch name { case "inactive": m.Inactive = value; case "max_age": m.MaxAge = &value; case "wait_timeout": m.WaitTimeout = &value }
 		case "ignore_headers": m.IgnoreHeaders = args
 		case "valid":
 			ttl, err := caddy.ParseDuration(args[len(args)-1]); if err != nil || ttl < 0 { return d.Err("valid requires a non-negative duration") }
@@ -311,12 +324,13 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	var log = m.logger.Sugar()
 	
 	var nocache_arg_name = "nocache"
-	var cacheable_methods = []string{"GET","HEAD"}
+	cacheable_methods := m.Methods; if cacheable_methods == nil { cacheable_methods = []string{"GET","HEAD"} }
 	//var cacheable_resp_status_range = []int{200,499}
   var cacheable_resp_ignore_headers = m.IgnoreHeaders // Eligibility only; never strip replayed headers.
   var cacheable_resp_status = []int{200, 301, 302, 303, 307, 308, 404}
   var cache_ttl = 300
-  var cache_max_wait = 300
+  cache_max_wait := 300*time.Second; if m.WaitTimeout != nil { cache_max_wait = time.Duration(*m.WaitTimeout) }
+  max_retention := time.Hour; if m.MaxAge != nil { max_retention = time.Duration(*m.MaxAge) }
   var fperm = os.FileMode(0700)
 
   var req_useragent = r.UserAgent()
@@ -353,15 +367,24 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
   var auth_header = r.Header.Get("Authorization")
   var range_header = r.Header.Get("Range")
   var nocache_header = r.Header.Get("X-NoCache")
+  bypass := auth_header!="" || nocache_header=="1" || nocache_arg=="1" || nocache_cookie_value=="1"
+  if m.Bypass != nil { var err error; bypass, err = m.Bypass.MatchWithError(r); if err != nil { return err } }
+  var is_req_cacheable = is_cacheable_method && !bypass && range_header=="" && r.Header.Get("Upgrade")==""
+  if !is_req_cacheable { return next.ServeHTTP(w,r) }
+  var body []byte
+  if r.Body != nil && r.Body != http.NoBody { var err error; body, err = io.ReadAll(r.Body); r.Body.Close(); if err != nil { return err }; r.GetBody = func() (io.ReadCloser,error) { return io.NopCloser(bytes.NewReader(body)),nil }; r.Body, _ = r.GetBody() }
+  repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+  repl.Set("http.request.body_hash", U.Md5(string(body)))
   var cache_fmt = "docroot: %v req_method: %v req_tls: %v req_proto: %v req_host: %v req_uri: %v auth_header: %v"
   //var cache_fmt = "%v|%v|%v|%v|%v|%v|%v"
   var cache_key = fmt.Sprintf(cache_fmt,docroot,req_method,req_tls,req_proto,req_host,req_uri,auth_header)
   header_hash := md5.New(); r.Header.Write(header_hash) // Cookies and every possible Vary dimension, before singleflight.
-  cache_key += fmt.Sprintf(" headers: %x policy: %#v/%q", header_hash.Sum(nil), m.Valid, m.IgnoreHeaders)
+  cache_key += fmt.Sprintf(" headers: %x body: %s", header_hash.Sum(nil), U.Md5(string(body)))
+  if m.Key != "" { var err error; cache_key, err = repl.ReplaceOrErr(m.Key, false, true); if err != nil { return err } }
+  cache_key += fmt.Sprintf(" policy: %#v/%q/%d/%d", m.Valid, m.IgnoreHeaders, max_retention, m.Inactive)
   var cache_key_md5 = U.Md5(cache_key)
   var cache_dir = filepath.Join(m.cache_dir,docroot_md5)
   var cache_path = filepath.Join(cache_dir,cache_key_md5)
-  var is_req_cacheable = is_cacheable_method && auth_header=="" && range_header=="" && nocache_header!="1" && nocache_arg!="1" && nocache_cookie_value!="1" && r.Header.Get("Upgrade")=="" && r.ContentLength==0
   
 	log.Debugln("nocache_arg_name: ",nocache_arg_name)
 	log.Debugln("cacheable_methods: ",cacheable_methods)
@@ -394,7 +417,7 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
   if !is_req_cacheable {
   	return next.ServeHTTP(w,r)
   } else {
-  	var wu = time.Now().Add(time.Duration(cache_max_wait) * time.Second)
+		var wu = time.Now().Add(cache_max_wait)
 	  for true {
 	  	var now = time.Now()
 		  var is_max_wait_elapsed = now.After(wu)
@@ -410,13 +433,14 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		  cache_stat, _ := cache_item_fd.Stat()
 		  br := bufio.NewReader(cache_item_fd)
 		  cache_item_key, _ := br.ReadString('\n')
-		  expires, _, _ := strings.Cut(cache_item_key, " ")
-		  expires_unix, _ := strconv.ParseInt(expires, 10, 64)
-		  var is_cache_item_valid = cache_stat!=nil && cache_stat.Size()>0 && expires_unix>0
+		  stamp := readStamp(cache_item_key)
+		  var is_cache_item_valid = stamp.retained(cache_stat)
+		  if !is_cache_item_valid { cache_item_fd.Close() }
+		  if is_cache_item_valid && m.Inactive > 0 { os.Chtimes(cache_path, now, now) }
 		  var cache_exptime = time.Time{}
 		  var is_cache_item_stale = false
 		  if cache_stat != nil {
-			cache_exptime = time.Unix(expires_unix, 0)
+			cache_exptime = time.Unix(stamp.expires, 0)
 		  	is_cache_item_stale = is_cache_item_valid && now.After(cache_exptime)
 		  }
 		  var is_cache_item_to_update = !is_cache_item_valid || is_cache_item_stale
@@ -432,13 +456,14 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		  owned := false
 		  if is_cache_item_to_update {
 			  cache_req := r.Clone(r.Context())
+			  if r.GetBody != nil { cache_req.Body, _ = r.GetBody() }
 			  cache_vars := maps.Clone(r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any))
 			  cache_server, _ := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
-			  sfc = m.sfg.DoChan(cache_key_md5,func() (interface{}, error) {
+			  sfc = m.sfg.DoChan(cache_path,func() (interface{}, error) {
 			    owned = true // Only this request may replay an uncacheable response; channel completion synchronizes access.
 			    if fd, err := os.Open(cache_path); err == nil { // A previous flight may have filled it after our lookup.
-			      line, _ := bufio.NewReader(fd).ReadString('\n'); fd.Close()
-			      expiry, _, _ := strings.Cut(line, " "); ts, _ := strconv.ParseInt(expiry, 10, 64); if time.Now().Unix() < ts { return true, nil }
+			      line, _ := bufio.NewReader(fd).ReadString('\n'); info, _ := fd.Stat(); fd.Close()
+			      stamp := readStamp(line); if stamp.retained(info) && time.Now().Unix() < stamp.expires { return true, nil }
 			    }
 			  	os.MkdirAll(cache_dir, fperm)
 			  	//ioutil.WriteFile(cache_path, []byte(cache_key), 0644)
@@ -447,7 +472,9 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 				cache_path_tmp := tmp_file_fd.Name()
 			  	var cache_item_key = fmt.Sprintf("time: %s %s req_useragent: %s req_remoteaddr: %s",time.Now().Format(time.DateTime),cache_key,req_useragent,req_remoteaddr)
 			  	fw := NewFileResponseWriter(cache_item_key,tmp_file_fd)
+			    var created time.Time
 			    fw.onHeader = func() {
+			      created = time.Now()
 			      h := fw.Header().Clone()
 			      for _, name := range cacheable_resp_ignore_headers { h.Del(name) }
 			      fw.cacheable = slices.Contains(cacheable_resp_status, fw.statusCode) && len(h.Values("Set-Cookie")) == 0
@@ -473,7 +500,7 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			        var err error; expiry, err = http.ParseTime(value); if err != nil { fw.cacheable = false }
 			      }
 			      fw.cacheable = fw.cacheable && expiry.After(time.Now())
-			      fw.key = fmt.Sprintf("%d %s", expiry.Unix(), fw.key)
+			      fw.key = fmt.Sprintf("%d %d %d %d %s", expiry.Unix(), created.UnixNano(), max_retention, m.Inactive, fw.key)
 			    }
 			    keep_temp := false
 			  	defer func() {
@@ -481,7 +508,7 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 					if !keep_temp { os.Remove(cache_path_tmp) }
 			  	}()
 			    ctx := cache_req.Context()
-			    if is_cache_item_valid { var cancel context.CancelFunc; ctx, cancel = context.WithTimeout(m.ctx, time.Duration(cache_max_wait)*time.Second); defer cancel() }
+			    if is_cache_item_valid { var cancel context.CancelFunc; ctx, cancel = context.WithTimeout(m.ctx, cache_max_wait); defer cancel() }
 			    cache_req = caddyhttp.PrepareRequest(cache_req.WithContext(ctx), caddy.NewReplacer(), fw, cache_server)
 			    for name, value := range cache_vars { caddyhttp.SetVar(cache_req.Context(), name, value) }
 			    cache_req = cache_req.WithContext(context.WithValue(cache_req.Context(), caddyhttp.OriginalRequestCtxKey, orig_req))
@@ -489,6 +516,7 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			    if next_err != nil { fw.cacheable = false; return nil, next_err }
 			    if !fw.wroteHeader { fw.WriteHeader(http.StatusOK) }
 			    if fw.writeErr != nil { return nil, fw.writeErr }
+			    if max_retention > 0 && time.Since(created) >= max_retention { fw.cacheable = false }
 			    if length := fw.Header().Get("Content-Length"); length != "" && cache_req.Method != "HEAD" { n, err := strconv.Atoi(length); if err != nil || n != fw.bodySize { return nil, io.ErrUnexpectedEOF } }
 			    if err := tmp_file_fd.Close(); err != nil { return nil, err }
 			    for retry := 0; ; retry++ { // Windows readers can briefly prevent replacement or invalidation.
@@ -504,8 +532,11 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 			if sfc!=nil && !is_cache_item_valid {
 				uncached_path := ""
+				received := false
+				defer func() { if !received { go func() { res := <-sfc; if path, ok := res.Val.(string); ok && owned { os.Remove(path) } }() } }()
 				select {
 					case res := <-sfc:
+						received = true
 						if res.Err != nil {
 							log.Debugln("error from singleflight next.ServeHTTP(): %v",res.Err)
 							return res.Err
@@ -513,6 +544,8 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 						if path, ok := res.Val.(string); ok { if !owned { return next.ServeHTTP(w,r) }; uncached_path = path; defer os.Remove(path) }
 						if cached, ok := res.Val.(bool); ok && !cached { return next.ServeHTTP(w,r) }
 					case <-time.After(time.Until(wu)):
+						return next.ServeHTTP(w,r)
+					case <-r.Context().Done(): return r.Context().Err()
 				}
 				if uncached_path == "" { continue }
 				var err error; cache_item_fd, err = os.Open(uncached_path); if err != nil { return err }; defer cache_item_fd.Close()
@@ -534,7 +567,7 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 				}
 				//log.Debugln("resp file line: ",line)
 				if(len(line)==0 || err_read!=nil) {
-					if cache_stat != nil { age, _ := strconv.ParseInt(w.Header().Get("Age"), 10, 64); w.Header().Set("Age", strconv.FormatInt(age+max(0,int64(time.Since(cache_stat.ModTime())/time.Second)),10)) }
+					if is_cache_item_valid { age, _ := strconv.ParseInt(w.Header().Get("Age"), 10, 64); w.Header().Set("Age", strconv.FormatInt(age+max(0,int64(time.Since(time.Unix(0,stamp.created))/time.Second)),10)) }
 					w.WriteHeader(statusCode)
 					break
 				}

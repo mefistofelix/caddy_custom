@@ -92,16 +92,31 @@ unchanged executables.
 This middleware caches GET/HEAD responses on disk, requires the HTTP `root`
 variable, and coalesces cache updates with `singleflight` per complete cache key.
 Preserve that granularity and immediate stale serving during background refresh.
-All request headers contribute to the key before coalescing, including cookies
-and possible Vary dimensions. Authorization, Range, request bodies, upgrades,
-and the implemented `nocache=1` signals bypass caching.
+By default, all request headers and the body contribute to the key before
+coalescing. An explicit placeholder key replaces these request dimensions;
+document the caller's responsibility for cookie, authorization, and Vary variants.
+Keep the document-root namespace and policy fingerprint. Coalesce by the full
+cache path, so identical template values in separate roots do not share a fill.
 
 Keep the production implementation minimal and in its existing single file.
-The supported options are `valid` (status/fallback TTL) and `ignore_headers`
-(response-policy overrides, never header removal). Response policy is evaluated
+The supported options are `methods`, `storage_path`, `key`, `bypass` (Caddy CEL),
+`inactive`, `max_age`, `wait_timeout`, `valid`, and `ignore_headers`. Reuse Caddy's
+replacer and CEL matcher rather than building a separate expression engine.
+An explicit CEL expression replaces the default Authorization/nocache bypass;
+Range and Upgrade bypass remain unconditional. Buffer eligible request bodies
+once and use independent readers for fills and fallbacks.
+
+`ignore_headers` overrides response policy, never removes headers. Policy is evaluated
 at final headers; only a complete successful response is published. Uncacheable
 responses must not be shared among waiting requests. Preserve response headers
 and isolate background request state from the original request.
+
+Keep freshness separate from retention. Mtime tracks last access only when
+`inactive` is enabled. Immutable creation time and stored durations enforce
+`max_age` and keep `Age` independent of touches. Enforce both retention limits
+on lookup and cleanup, including for stale entries. Stop the cleaner with the
+module context; do not leave timers running after cleanup. Temporary files stay
+on the cache filesystem and abandoned private fills must be removed.
 
 The README describes the implemented policy and remaining limitations; do not
 imply complete RFC or Nginx compatibility. Nginx is a reference for relevant
