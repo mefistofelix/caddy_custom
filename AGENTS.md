@@ -117,8 +117,12 @@ once and use independent readers for fills and fallbacks.
 
 `ignore_headers` overrides response policy, never removes headers. Policy is evaluated
 at final headers; only a complete successful response is published. Uncacheable
-responses must not be shared among waiting requests. Preserve response headers
-and isolate background request state from the original request.
+responses must not be shared among waiting requests. Create response files only
+after final headers approve caching. Stream header-rejected responses to their
+owner without disk or whole-body buffering; only the request goroutine may write
+to its client. Close private pipes on timeout/cancellation and do not propagate
+their failures to waiting clients. Preserve response headers and isolate
+background request state from the original request.
 
 Keep freshness separate from retention. Mtime tracks last access only when
 `inactive` is enabled. Immutable creation time and stored durations enforce

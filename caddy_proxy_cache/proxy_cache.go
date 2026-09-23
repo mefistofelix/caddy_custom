@@ -127,6 +127,7 @@ func (frw *FileResponseWriter) Write(p []byte) (n int, err error) {
 	if !frw.wroteHeader {
 		frw.WriteHeader(http.StatusOK)
 	}
+	if frw.writeErr != nil { return 0, frw.writeErr }
 	nw,err := frw.w.Write(p)
 	if err != nil { frw.writeErr = err }
 	frw.bodySize += nw
@@ -141,6 +142,7 @@ func (frw *FileResponseWriter) WriteHeader(statusCode int) {
 	frw.wroteHeader = true
 	frw.statusCode = statusCode
 	if frw.onHeader != nil { frw.onHeader() }
+	if !frw.cacheable || frw.writeErr != nil { return }
 	if _, err := fmt.Fprintf(frw.w, "%s\n", frw.key); err != nil { frw.writeErr = err }
 	//fmt.Fprintf(os.Stderr, "WriteHeader: %d\n", statusCode)
 	for name, values := range frw.Header() {
@@ -483,24 +485,25 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 		  var sfc <-chan singleflight.Result
 		  owned := false
+		  direct := make(chan *http.Response, 1)
+		  var reader *io.PipeReader; var writer *io.PipeWriter
 		  if is_cache_item_to_update {
+			  if !is_cache_item_valid { reader, writer = io.Pipe(); defer reader.Close(); defer writer.Close() }
 			  cache_req := r.Clone(r.Context())
 			  if r.GetBody != nil { cache_req.Body, _ = r.GetBody() }
 			  cache_vars := maps.Clone(r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any))
 			  cache_server, _ := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
-			  sfc = m.sfg.DoChan(cache_path,func() (interface{}, error) {
+			  sfc = m.sfg.DoChan(cache_path,func() (result interface{}, resultErr error) {
 			    owned = true // Only this request may replay an uncacheable response; channel completion synchronizes access.
+			    if writer != nil { defer func() { writer.CloseWithError(resultErr) }() }
 			    if fd, err := os.Open(cache_path); err == nil { // A previous flight may have filled it after our lookup.
 			      line, _ := bufio.NewReader(fd).ReadString('\n'); info, _ := fd.Stat(); fd.Close()
 			      stamp := readStamp(line); if stamp.retained(info) && time.Now().Unix() < stamp.expires && (cache_path == main_path || stamp.matches(cache_key_md5, vary_headers)) { return true, nil }
 			    }
-			  	os.MkdirAll(cache_dir, fperm)
-			  	//ioutil.WriteFile(cache_path, []byte(cache_key), 0644)
-				tmp_file_fd, tmp_err := os.CreateTemp(cache_dir, ".response-*")
-				if tmp_err != nil { return nil, tmp_err }
-				cache_path_tmp := tmp_file_fd.Name()
+			    var tmp_file_fd *os.File; cache_path_tmp := ""
 			  	var cache_item_key = fmt.Sprintf("time: %s %s req_useragent: %s req_remoteaddr: %s",time.Now().Format(time.DateTime),cache_key,req_useragent,req_remoteaddr)
-			  	fw := NewFileResponseWriter(cache_item_key,tmp_file_fd)
+			    fw := NewFileResponseWriter(cache_item_key,io.Discard)
+			    defer func() { if fw.wroteHeader && !fw.cacheable && tmp_file_fd == nil { result = false } }() // Private stream failures belong only to its owner.
 			    var created time.Time
 			    write_path := cache_path
 			    fw.onHeader = func() {
@@ -533,11 +536,17 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			      vary := strings.Join(h.Values("Vary"), ","); variant := cacheVariant(cache_key_md5, vary, vary_headers)
 			      if cache_path != main_path && variant != filepath.Base(cache_path) { write_path = main_path } // Vary changed or disappeared.
 			      fw.key = fmt.Sprintf("%d %d %d %d %q %s %s", expiry.Unix(), created.UnixNano(), max_retention, m.Inactive, vary, variant, fw.key)
+			      if !fw.cacheable {
+			        if writer != nil { fw.w = writer; direct <- &http.Response{StatusCode: fw.statusCode, Header: fw.Header().Clone(), Body: reader} }
+			        return
+			      }
+			      if fw.writeErr = os.MkdirAll(cache_dir, fperm); fw.writeErr != nil { return }
+			      tmp_file_fd, fw.writeErr = os.CreateTemp(cache_dir, ".response-*")
+			      if fw.writeErr == nil { cache_path_tmp = tmp_file_fd.Name(); fw.w = tmp_file_fd }
 			    }
 			    keep_temp := false
 			  	defer func() {
-			  		tmp_file_fd.Close()
-					if !keep_temp { os.Remove(cache_path_tmp) }
+			      if tmp_file_fd != nil { tmp_file_fd.Close(); if !keep_temp { os.Remove(cache_path_tmp) } }
 			  	}()
 			    ctx := cache_req.Context()
 			    if is_cache_item_valid { var cancel context.CancelFunc; ctx, cancel = context.WithTimeout(m.ctx, cache_max_wait); defer cancel() }
@@ -550,12 +559,12 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			    if fw.writeErr != nil { return nil, fw.writeErr }
 			    if max_retention > 0 && time.Since(created) >= max_retention { fw.cacheable = false }
 			    if length := fw.Header().Get("Content-Length"); length != "" && cache_req.Method != "HEAD" { n, err := strconv.Atoi(length); if err != nil || n != fw.bodySize { return nil, io.ErrUnexpectedEOF } }
-			    if err := tmp_file_fd.Close(); err != nil { return nil, err }
+			    if tmp_file_fd != nil { if err := tmp_file_fd.Close(); err != nil { return nil, err } }
 			    for retry := 0; ; retry++ { // Windows readers can briefly prevent replacement or invalidation.
-			      var err error; if fw.cacheable { err = os.Rename(cache_path_tmp,write_path) } else { err = os.Remove(cache_path); if os.IsNotExist(err) { err = nil } }
+			      var err error; if fw.cacheable { err = os.Rename(cache_path_tmp,write_path) } else if is_cache_item_valid { err = os.Remove(cache_path); if os.IsNotExist(err) { err = nil } }
 			      if err == nil { break }; if retry >= 50 { return nil, err }; time.Sleep(10*time.Millisecond)
 			    }
-			    if !fw.cacheable { if !is_cache_item_valid { keep_temp = true; return cache_path_tmp, nil }; return false, nil }
+			    if !fw.cacheable { if !is_cache_item_valid && tmp_file_fd != nil { keep_temp = true; return cache_path_tmp, nil }; return false, nil }
 				  log.Debugln("---")
 					return true, next_err
 				})
@@ -564,20 +573,28 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 			if sfc!=nil && !is_cache_item_valid {
 				uncached_path := ""
+				var response *http.Response
 				received := false
 				defer func() { if !received { go func() { res := <-sfc; if path, ok := res.Val.(string); ok && owned { os.Remove(path) } }() } }()
 				select {
+					case response = <-direct:
 					case res := <-sfc:
 						received = true
+						select { case response = <-direct: default: }; if response != nil { break }
+						if cached, ok := res.Val.(bool); ok && !cached { return next.ServeHTTP(w,r) }
 						if res.Err != nil {
 							log.Debugln("error from singleflight next.ServeHTTP(): %v",res.Err)
 							return res.Err
 						}
 						if path, ok := res.Val.(string); ok { if !owned { return next.ServeHTTP(w,r) }; uncached_path = path; defer os.Remove(path) }
-						if cached, ok := res.Val.(bool); ok && !cached { return next.ServeHTTP(w,r) }
 					case <-time.After(time.Until(wu)):
 						return next.ServeHTTP(w,r)
 					case <-r.Context().Done(): return r.Context().Err()
+				}
+				if response != nil {
+					stop := context.AfterFunc(r.Context(), func() { reader.CloseWithError(r.Context().Err()) }); defer stop()
+					for name, values := range response.Header { w.Header()[name] = values }; w.WriteHeader(response.StatusCode)
+					_, err := io.Copy(w, response.Body); return err
 				}
 				if uncached_path == "" { continue }
 				var err error; cache_item_fd, err = os.Open(uncached_path); if err != nil { return err }; defer cache_item_fd.Close()

@@ -396,20 +396,28 @@ pattern, not its binary format or every HTTP normalization rule.
    The refresh has its own request variables and a context tied to the module,
    so completing the original request does not cancel it. Concurrent requests
    keep receiving the previous copy while one refresh runs for their exact key.
-6. Captures the response in a unique temporary file and publishes only after a
-   successful complete body and file close, using rename. A newly uncacheable
-   refresh removes the previous entry. Uncacheable miss responses are still
-   temporarily spooled for their owner, then removed after replay. Incomplete
-   responses and failed refreshes do not replace an existing entry.
+6. Keeps response headers in memory until the final status, then decides where
+   the body goes. A cacheable response creates a unique temporary file and is
+   published only after a successful complete body and file close, using rename.
+   A response rejected by header policy streams to its initiating request through
+   an unbuffered pipe, with no response file and no whole-body memory buffer.
+   The request goroutine alone writes to its client; timeout or cancellation closes
+   the pipe so an abandoned producer cannot write to that client later. Waiting
+   requests obtain their own upstream responses, including if the private stream
+   fails. Background refreshes discard uncacheable bodies and remove the previous
+   entry only after successful completion. Incomplete responses and failed
+   refreshes do not replace an existing entry.
 
 Cache metadata includes response expiry, creation time, both retention
-durations, `Vary`, and a variant hash. Older-format entries are refilled. After timeout or cancellation,
-an abandoned private fill is removed when the producer finishes.
+durations, `Vary`, and a variant hash. Older-format entries are refilled. A response
+accepted at headers can still exceed `max_age` during capture: its existing
+temporary file is then replayed only to its owner and removed, without publication.
+Abandoned captures are cleaned up when the producer finishes.
 
 | Source setting | Value |
 | --- | --- |
 | Default response freshness | 300 seconds; configurable and overridden by response freshness headers |
-| Maximum wait for a missing entry | `wait_timeout`, then calls the next middleware directly without caching that fallback |
+| Maximum wait for a missing entry | `wait_timeout`, then calls the next middleware directly without caching that fallback. Once an uncacheable response starts streaming, its lifetime follows the request context instead. |
 | Background refresh timeout | `wait_timeout` |
 | Cleanup interval | 30 seconds; stops when the module is cleaned up |
 | File age eligible for cleanup | Either enabled retention limit has expired; abandoned temporary files older than one hour are also removed |

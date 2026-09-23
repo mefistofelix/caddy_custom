@@ -1002,6 +1002,170 @@ func TestRetentionAndAccessTime(t *testing.T) {
 	}
 }
 
+type observedResponse struct {
+	*httptest.ResponseRecorder
+	written chan struct{}
+}
+
+func (w *observedResponse) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	select {
+	case w.written <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
+func TestUncacheableStreamsWithoutDisk(t *testing.T) {
+	for _, policy := range []string{"status", "private", "no-store", "cookie", "vary", "blocked-storage"} {
+		t.Run(policy, func(t *testing.T) {
+			m := newTestCache(t)
+			if policy == "blocked-storage" {
+				m.cache_dir = filepath.Join(m.cache_dir, "not-a-directory")
+				if err := os.WriteFile(m.cache_dir, []byte("unchanged"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			checkDisk := func() {
+				if policy == "blocked-storage" {
+					b, err := os.ReadFile(m.cache_dir)
+					if err != nil || string(b) != "unchanged" {
+						t.Fatalf("storage changed: %q %v", b, err)
+					}
+				} else if paths := files(t, m); len(paths) != 0 {
+					t.Fatalf("response touched disk: %v", paths)
+				}
+			}
+			started, headers, body := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			releaseHeaders := sync.OnceFunc(func() { close(headers) })
+			defer releaseHeaders()
+			releaseBody := sync.OnceFunc(func() { close(body) })
+			defer releaseBody()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.WriteHeader(103)
+				close(started)
+				<-headers
+				code := 200
+				switch policy {
+				case "status":
+					code = 500
+				case "private":
+					w.Header().Set("Cache-Control", "private")
+				case "cookie":
+					w.Header().Set("Set-Cookie", "session=private")
+				case "vary":
+					w.Header().Set("Vary", "*")
+				default:
+					w.Header().Set("Cache-Control", "no-store")
+				}
+				w.WriteHeader(code)
+				if _, err := io.WriteString(w, "first-"); err != nil {
+					return err
+				}
+				<-body
+				_, err := io.WriteString(w, "last")
+				return err
+			})
+			w := &observedResponse{httptest.NewRecorder(), make(chan struct{}, 1)}
+			done := make(chan error, 1)
+			go func() { done <- m.ServeHTTP(w, request(nil), next) }()
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("upstream not reached")
+			}
+			checkDisk()
+			releaseHeaders()
+			select {
+			case <-w.written:
+			case err := <-done:
+				t.Fatalf("early return: %v", err)
+			case <-time.After(3 * time.Second):
+				t.Fatal("private body was buffered instead of streamed")
+			}
+			checkDisk()
+			releaseBody()
+			if err := <-done; err != nil || w.Body.String() != "first-last" {
+				t.Fatalf("stream: %q %v", w.Body.String(), err)
+			}
+			if policy == "status" && w.Code != 500 {
+				t.Fatalf("status=%d", w.Code)
+			}
+			checkDisk()
+		})
+	}
+}
+
+func TestPrivateStreamCancellationDoesNotFailWaiters(t *testing.T) {
+	m := newTestCache(t)
+	var calls atomic.Int32
+	producerDone := make(chan error, 1)
+	late := make(chan struct{})
+	releaseLate := sync.OnceFunc(func() { close(late) })
+	defer releaseLate()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		id := calls.Add(1)
+		w.Header().Set("Set-Cookie", fmt.Sprintf("user=%d", id))
+		_, err := fmt.Fprintf(w, "user=%d", id)
+		if id == 1 {
+			<-r.Context().Done()
+			<-late
+			_, err = io.WriteString(w, "after-cancel")
+			producerDone <- err
+		}
+		return err
+	})
+	r := request(nil)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	w := &observedResponse{httptest.NewRecorder(), make(chan struct{}, 1)}
+	done := make(chan error, 1)
+	go func() { done <- m.ServeHTTP(w, r.WithContext(ctx), next) }()
+	select {
+	case <-w.written:
+	case <-time.After(3 * time.Second):
+		t.Fatal("owner stream not started")
+	}
+	waiter := make(chan error, 1)
+	go func() {
+		w, err := perform(m, request(nil), next)
+		if err == nil && (w.Body.String() != "user=2" || w.Header().Get("Set-Cookie") != "user=2") {
+			err = fmt.Errorf("waiter received %s", w.Body.String())
+		}
+		waiter <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled stream succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled reader blocked")
+	}
+	releaseLate()
+	select {
+	case err := <-producerDone:
+		if err == nil {
+			t.Fatal("producer wrote after cancellation")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("producer blocked")
+	}
+	select {
+	case err := <-waiter:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter blocked")
+	}
+	if w.Body.String() != "user=1" || len(files(t, m)) != 0 {
+		t.Fatal("late write or disk spill")
+	}
+}
+
 func TestWaitTimeoutPreservesBodyAndCleansPrivateFill(t *testing.T) {
 	m := newTestCache(t)
 	m.Methods = []string{"POST"}
