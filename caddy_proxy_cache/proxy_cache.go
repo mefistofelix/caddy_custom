@@ -15,6 +15,8 @@ import "os"
 import "bufio"
 import "strconv"
 import "strings"
+import "context"
+import "maps"
 
 import "golang.org/x/sync/singleflight"
 
@@ -102,6 +104,9 @@ type FileResponseWriter struct {
 	statusCode int
 	w io.Writer
 	key string
+	cacheable bool
+	onHeader func()
+	writeErr error
 }
 
 func NewFileResponseWriter(key string,w io.Writer) *FileResponseWriter {
@@ -122,26 +127,28 @@ func (frw *FileResponseWriter) Write(p []byte) (n int, err error) {
 		frw.WriteHeader(http.StatusOK)
 	}
 	nw,err := frw.w.Write(p)
+	if err != nil { frw.writeErr = err }
 	frw.bodySize += nw
 	return nw,err
 }
 
 func (frw *FileResponseWriter) WriteHeader(statusCode int) {
+	if statusCode >= 100 && statusCode < 200 { return } // Wait for final response headers.
 	if frw.wroteHeader {
 		return
 	}
 	frw.wroteHeader = true
 	frw.statusCode = statusCode
-	fmt.Fprintf(frw.w, "%s\n", frw.key)
+	if frw.onHeader != nil { frw.onHeader() }
+	if _, err := fmt.Fprintf(frw.w, "%s\n", frw.key); err != nil { frw.writeErr = err }
 	//fmt.Fprintf(os.Stderr, "WriteHeader: %d\n", statusCode)
 	for name, values := range frw.Header() {
 		for _, v := range values {
 			//fmt.Fprintf(os.Stderr, "WriteHeader: %s: %s\n", name,v)
-    	fmt.Fprintf(frw.w, "%s: %s\n", name,v)
+			if _, err := fmt.Fprintf(frw.w, "%s: %s\n", name,v); err != nil { frw.writeErr = err }
   	}
   }
-  fmt.Fprintf(frw.w, "%d\n", statusCode)
-  fmt.Fprintf(frw.w, "\n")
+  if _, err := fmt.Fprintf(frw.w, "%d\n\n", statusCode); err != nil { frw.writeErr = err }
 }
 
 func (frw *FileResponseWriter) IsOk() bool {
@@ -166,6 +173,9 @@ func (rww *ResponseWriterWrapper) ReadFrom(r io.Reader) (n int64, err error) {
 //--------------------------------------------------------------------------------
 
 type ProxyCache struct {
+	Valid map[string]caddy.Duration `json:"valid,omitempty"`
+	IgnoreHeaders []string `json:"ignore_headers,omitempty"`
+	ctx context.Context
 	logger *zap.Logger
 	sfg *singleflight.Group
 	cache_dir string
@@ -197,6 +207,7 @@ func (ProxyCache) CaddyModule() caddy.ModuleInfo {
 }
 
 func (m *ProxyCache) Provision(ctx caddy.Context) error {
+	m.ctx = ctx
 	m.logger = ctx.Logger()
 	//defer m.logger.Sync()
 	//var log = m.logger.Sugar()
@@ -266,6 +277,20 @@ func (m *ProxyCache) cleanCache() {
 
 func (m *ProxyCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
+	if d.NextArg() { return d.ArgErr() }
+	for d.NextBlock(0) {
+		name, args := d.Val(), d.RemainingArgs()
+		if len(args) == 0 { return d.ArgErr() }
+		switch name {
+		case "ignore_headers": m.IgnoreHeaders = args
+		case "valid":
+			ttl, err := caddy.ParseDuration(args[len(args)-1]); if err != nil || ttl < 0 { return d.Err("valid requires a non-negative duration") }
+			codes := args[:len(args)-1]; if len(codes)==0 { codes=[]string{"200","301","302"} }
+			if m.Valid == nil { m.Valid = make(map[string]caddy.Duration) }
+			for _, code := range codes { n, err := strconv.Atoi(code); if code!="any" && (err!=nil || n<200 || n>599) { return d.Err("invalid cache status") }; m.Valid[code]=caddy.Duration(ttl) }
+		default: return d.Errf("unknown proxy_cache option: %s", name)
+		}
+	}
 	return nil
 }
 
@@ -288,7 +313,8 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	var nocache_arg_name = "nocache"
 	var cacheable_methods = []string{"GET","HEAD"}
 	//var cacheable_resp_status_range = []int{200,499}
-  var cacheable_resp_ignore_headers = []string{"Cache-Control", "Expires", "Set-Cookie"}
+  var cacheable_resp_ignore_headers = m.IgnoreHeaders // Eligibility only; never strip replayed headers.
+  var cacheable_resp_status = []int{200, 301, 302, 303, 307, 308, 404}
   var cache_ttl = 300
   var cache_max_wait = 300
   var fperm = os.FileMode(0700)
@@ -330,10 +356,12 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
   var cache_fmt = "docroot: %v req_method: %v req_tls: %v req_proto: %v req_host: %v req_uri: %v auth_header: %v"
   //var cache_fmt = "%v|%v|%v|%v|%v|%v|%v"
   var cache_key = fmt.Sprintf(cache_fmt,docroot,req_method,req_tls,req_proto,req_host,req_uri,auth_header)
+  header_hash := md5.New(); r.Header.Write(header_hash) // Cookies and every possible Vary dimension, before singleflight.
+  cache_key += fmt.Sprintf(" headers: %x policy: %#v/%q", header_hash.Sum(nil), m.Valid, m.IgnoreHeaders)
   var cache_key_md5 = U.Md5(cache_key)
   var cache_dir = filepath.Join(m.cache_dir,docroot_md5)
   var cache_path = filepath.Join(cache_dir,cache_key_md5)
-  var is_req_cacheable = is_cacheable_method && auth_header=="" && range_header=="" && nocache_header!="1" && nocache_arg!="1" && nocache_cookie_value!="1"
+  var is_req_cacheable = is_cacheable_method && auth_header=="" && range_header=="" && nocache_header!="1" && nocache_arg!="1" && nocache_cookie_value!="1" && r.Header.Get("Upgrade")=="" && r.ContentLength==0
   
 	log.Debugln("nocache_arg_name: ",nocache_arg_name)
 	log.Debugln("cacheable_methods: ",cacheable_methods)
@@ -380,11 +408,15 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		  cache_item_fd, _ := os.Open(cache_path)
 		  defer cache_item_fd.Close()
 		  cache_stat, _ := cache_item_fd.Stat()
-		  var is_cache_item_valid = cache_stat!=nil && cache_stat.Size()>0
+		  br := bufio.NewReader(cache_item_fd)
+		  cache_item_key, _ := br.ReadString('\n')
+		  expires, _, _ := strings.Cut(cache_item_key, " ")
+		  expires_unix, _ := strconv.ParseInt(expires, 10, 64)
+		  var is_cache_item_valid = cache_stat!=nil && cache_stat.Size()>0 && expires_unix>0
 		  var cache_exptime = time.Time{}
 		  var is_cache_item_stale = false
 		  if cache_stat != nil {
-		  	cache_exptime = cache_stat.ModTime().Add(time.Duration(cache_ttl) * time.Second)
+			cache_exptime = time.Unix(expires_unix, 0)
 		  	is_cache_item_stale = is_cache_item_valid && now.After(cache_exptime)
 		  }
 		  var is_cache_item_to_update = !is_cache_item_valid || is_cache_item_stale
@@ -397,28 +429,73 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		  log.Debugln("---")
 
 		  var sfc <-chan singleflight.Result
+		  owned := false
 		  if is_cache_item_to_update {
+			  cache_req := r.Clone(r.Context())
+			  cache_vars := maps.Clone(r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any))
+			  cache_server, _ := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
 			  sfc = m.sfg.DoChan(cache_key_md5,func() (interface{}, error) {
+			    owned = true // Only this request may replay an uncacheable response; channel completion synchronizes access.
+			    if fd, err := os.Open(cache_path); err == nil { // A previous flight may have filled it after our lookup.
+			      line, _ := bufio.NewReader(fd).ReadString('\n'); fd.Close()
+			      expiry, _, _ := strings.Cut(line, " "); ts, _ := strconv.ParseInt(expiry, 10, 64); if time.Now().Unix() < ts { return true, nil }
+			    }
 			  	os.MkdirAll(cache_dir, fperm)
 			  	//ioutil.WriteFile(cache_path, []byte(cache_key), 0644)
-			  	var cache_path_tmp = fmt.Sprintf("%s.tmp",cache_path)
-			  	tmp_file_fd, _ := os.OpenFile(cache_path_tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fperm)
+				tmp_file_fd, tmp_err := os.CreateTemp(cache_dir, ".response-*")
+				if tmp_err != nil { return nil, tmp_err }
+				cache_path_tmp := tmp_file_fd.Name()
 			  	var cache_item_key = fmt.Sprintf("time: %s %s req_useragent: %s req_remoteaddr: %s",time.Now().Format(time.DateTime),cache_key,req_useragent,req_remoteaddr)
 			  	fw := NewFileResponseWriter(cache_item_key,tmp_file_fd)
+			    fw.onHeader = func() {
+			      h := fw.Header().Clone()
+			      for _, name := range cacheable_resp_ignore_headers { h.Del(name) }
+			      fw.cacheable = slices.Contains(cacheable_resp_status, fw.statusCode) && len(h.Values("Set-Cookie")) == 0
+			      expiry := time.Now().Add(time.Duration(cache_ttl) * time.Second)
+			      if m.Valid != nil { ttl, ok := m.Valid[strconv.Itoa(fw.statusCode)]; if !ok { ttl = m.Valid["any"] }; expiry = time.Now().Add(time.Duration(ttl)); fw.cacheable = ttl>0 && len(h.Values("Set-Cookie"))==0 }
+			      for _, v := range strings.Split(strings.Join(h.Values("Vary"), ","), ",") { if strings.TrimSpace(v) == "*" { fw.cacheable = false } }
+			      max_age, shared_age := "", ""
+			      for _, directive := range strings.Split(strings.Join(h.Values("Cache-Control"), ","), ",") {
+			        name, value, _ := strings.Cut(strings.TrimSpace(directive), "=")
+			        switch strings.ToLower(strings.TrimSpace(name)) {
+			        case "private", "no-cache", "no-store": fw.cacheable = false
+			        case "max-age": if max_age != "" { fw.cacheable = false }; max_age = strings.Trim(strings.TrimSpace(value), "\""); if max_age == "" { fw.cacheable = false }
+			        case "s-maxage": if shared_age != "" { fw.cacheable = false }; shared_age = strings.Trim(strings.TrimSpace(value), "\""); if shared_age == "" { fw.cacheable = false }
+			        }
+			      }
+			      if shared_age != "" { max_age = shared_age }
+			      if max_age != "" {
+			        ttl, err := strconv.ParseInt(max_age, 10, 32)
+			        age, _ := strconv.ParseInt(h.Get("Age"), 10, 32)
+			        if date, err := http.ParseTime(h.Get("Date")); err == nil { age = max(age, int64(time.Since(date)/time.Second)) }
+			        if err != nil || ttl <= 0 { fw.cacheable = false }; expiry = time.Now().Add(time.Duration(ttl-max(0,age)) * time.Second)
+			      } else if value := h.Get("Expires"); value != "" {
+			        var err error; expiry, err = http.ParseTime(value); if err != nil { fw.cacheable = false }
+			      }
+			      fw.cacheable = fw.cacheable && expiry.After(time.Now())
+			      fw.key = fmt.Sprintf("%d %s", expiry.Unix(), fw.key)
+			    }
+			    keep_temp := false
 			  	defer func() {
-			  		log.Debugln("cache_key: ",cache_key)
 			  		tmp_file_fd.Close()
-				  	if fw.IsOk() {
-					  	log.Debugln("remove: ",cache_path)
-					  	os.Remove(cache_path)
-					  	log.Debugln("rename: ",cache_path_tmp,cache_path)
-					  	os.Rename(cache_path_tmp,cache_path)
-					  } else {
-					  	log.Debugln("remove invalid tmp: ",cache_path_tmp)
-					  	os.Remove(cache_path_tmp)
-					  }
+					if !keep_temp { os.Remove(cache_path_tmp) }
 			  	}()
-			  	var next_err = next.ServeHTTP(fw,r)
+			    ctx := cache_req.Context()
+			    if is_cache_item_valid { var cancel context.CancelFunc; ctx, cancel = context.WithTimeout(m.ctx, time.Duration(cache_max_wait)*time.Second); defer cancel() }
+			    cache_req = caddyhttp.PrepareRequest(cache_req.WithContext(ctx), caddy.NewReplacer(), fw, cache_server)
+			    for name, value := range cache_vars { caddyhttp.SetVar(cache_req.Context(), name, value) }
+			    cache_req = cache_req.WithContext(context.WithValue(cache_req.Context(), caddyhttp.OriginalRequestCtxKey, orig_req))
+				var next_err = next.ServeHTTP(fw,cache_req)
+			    if next_err != nil { fw.cacheable = false; return nil, next_err }
+			    if !fw.wroteHeader { fw.WriteHeader(http.StatusOK) }
+			    if fw.writeErr != nil { return nil, fw.writeErr }
+			    if length := fw.Header().Get("Content-Length"); length != "" && cache_req.Method != "HEAD" { n, err := strconv.Atoi(length); if err != nil || n != fw.bodySize { return nil, io.ErrUnexpectedEOF } }
+			    if err := tmp_file_fd.Close(); err != nil { return nil, err }
+			    for retry := 0; ; retry++ { // Windows readers can briefly prevent replacement or invalidation.
+			      var err error; if fw.cacheable { err = os.Rename(cache_path_tmp,cache_path) } else { err = os.Remove(cache_path); if os.IsNotExist(err) { err = nil } }
+			      if err == nil { break }; if retry >= 50 { return nil, err }; time.Sleep(10*time.Millisecond)
+			    }
+			    if !fw.cacheable { if !is_cache_item_valid { keep_temp = true; return cache_path_tmp, nil }; return false, nil }
 				  log.Debugln("---")
 					return true, next_err
 				})
@@ -426,22 +503,25 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			}
 
 			if sfc!=nil && !is_cache_item_valid {
+				uncached_path := ""
 				select {
 					case res := <-sfc:
 						if res.Err != nil {
 							log.Debugln("error from singleflight next.ServeHTTP(): %v",res.Err)
 							return res.Err
 						}
+						if path, ok := res.Val.(string); ok { if !owned { return next.ServeHTTP(w,r) }; uncached_path = path; defer os.Remove(path) }
+						if cached, ok := res.Val.(bool); ok && !cached { return next.ServeHTTP(w,r) }
 					case <-time.After(time.Until(wu)):
 				}
-				continue
+				if uncached_path == "" { continue }
+				var err error; cache_item_fd, err = os.Open(uncached_path); if err != nil { return err }; defer cache_item_fd.Close()
+				br = bufio.NewReader(cache_item_fd); cache_item_key, _ = br.ReadString('\n')
 			}
 
 			//d,_ := ioutil.ReadFile(cache_path)
 			//w.Write(d)
 			//io.Copy(w,cache_item_file)
-			br := bufio.NewReader(cache_item_fd)
-			cache_item_key, _ := br.ReadString('\n')
 			log.Debugln("start serve cached item: ",cache_key_md5)
 			log.Debugln("cache_item_key: ",cache_item_key)
 			log.Debugln("cache_path: ",cache_path)
@@ -454,6 +534,7 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 				}
 				//log.Debugln("resp file line: ",line)
 				if(len(line)==0 || err_read!=nil) {
+					if cache_stat != nil { age, _ := strconv.ParseInt(w.Header().Get("Age"), 10, 64); w.Header().Set("Age", strconv.FormatInt(age+max(0,int64(time.Since(cache_stat.ModTime())/time.Second)),10)) }
 					w.WriteHeader(statusCode)
 					break
 				}
@@ -462,9 +543,7 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 					statusCode, _ = strconv.Atoi(line)
 				} else {
 					//@todo normalize header names?
-					if slices.Index(cacheable_resp_ignore_headers,toks[0]) == -1 {
 						w.Header().Add(toks[0],toks[1])
-					}
 				}
 			}
 			io.Copy(w,br)

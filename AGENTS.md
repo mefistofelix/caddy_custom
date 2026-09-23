@@ -90,15 +90,23 @@ unchanged executables.
 ### proxy_cache
 
 This middleware caches GET/HEAD responses on disk, requires the HTTP `root`
-variable, and coalesces cache updates with `singleflight`. Freshness is 300
-seconds; stale responses may be served during background refresh. Authorization,
-Range, and the implemented `nocache=1` signals bypass caching.
+variable, and coalesces cache updates with `singleflight` per complete cache key.
+Preserve that granularity and immediate stale serving during background refresh.
+All request headers contribute to the key before coalescing, including cookies
+and possible Vary dimensions. Authorization, Range, request bodies, upgrades,
+and the implemented `nocache=1` signals bypass caching.
 
-Settings are currently constants in the source. Do not document unimplemented
-Caddyfile options. This is not a complete HTTP cache: session cookies, Vary,
-response status codes, and cache-control headers need explicit consideration.
-Headers omitted from replay can still be stored on disk. Debug logs can include
-Authorization and full request URLs.
+Keep the production implementation minimal and in its existing single file.
+The supported options are `valid` (status/fallback TTL) and `ignore_headers`
+(response-policy overrides, never header removal). Response policy is evaluated
+at final headers; only a complete successful response is published. Uncacheable
+responses must not be shared among waiting requests. Preserve response headers
+and isolate background request state from the original request.
+
+The README describes the implemented policy and remaining limitations; do not
+imply complete RFC or Nginx compatibility. Nginx is a reference for relevant
+configuration semantics, not a mandate to reproduce its cache architecture.
+Debug logs can include Authorization and full request URLs.
 
 When changing this middleware, check cache miss/hit, expiry, concurrent requests,
 bypass, upstream failure, and filesystem errors. Do not turn a dependency update
@@ -123,9 +131,10 @@ git diff --check
 ```
 
 Adjust the compiler path to match `build.sh`. Check `version` and `list-modules`
-on Windows when available. No functional test files currently exist: report
-`[no test files]` accurately, and distinguish compilation, CLI execution, and
-real HTTP behavior checks.
+on Windows when available. Cache behavior tests live in
+`caddy_proxy_cache/proxy_cache_test.go`; run them with `-race` when changing
+concurrency (requires `CGO_ENABLED=1` and a C compiler). Distinguish compilation,
+CLI execution, in-process handler tests, and checks against a running server.
 
 For documentation changes, verify file paths, commands, versions, and agreement
 with the source. Avoid repeating unchanged binary builds solely for documentation.

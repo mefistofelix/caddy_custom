@@ -236,45 +236,99 @@ Then run in PowerShell:
 
 Registered as `http.handlers.proxy_cache`, with the Caddyfile directive
 `proxy_cache`. It requires the HTTP `root` variable, which also separates cached
-content by site. TTL, storage location, and cache policy currently have no
-Caddyfile options; they are defined in the Go source.
+content by site. The implementation remains in `caddy_proxy_cache/proxy_cache.go`.
+
+### Response policy and configuration
+
+```caddyfile
+proxy_cache {
+    valid 200 301 302 303 307 308 5m
+    valid 404 30s
+    # Optional overrides, only when appropriate for the upstream:
+    # ignore_headers Cache-Control Expires
+}
+```
+
+The configuration borrows the relevant semantics of Nginx's
+[`proxy_cache_valid`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_valid)
+and [`proxy_ignore_headers`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_ignore_headers):
+
+- `valid [status ...|any] duration` selects eligible statuses and their fallback
+  TTL. Repeat it for different statuses; an exact status takes precedence over
+  `any`. With no statuses, it applies to 200, 301, and 302. A zero duration disables
+  that status. Once `valid` is configured, unlisted statuses are not cached unless
+  covered by `any`.
+- Bare `proxy_cache` caches statuses 200, 301, 302, 303, 307, 308, and 404 for up to
+  five minutes, subject to the response headers below.
+- `ignore_headers Header ...` disables processing of those response headers for
+  cache policy. It does **not** remove headers from the client response or disk.
+  Relevant names are `Cache-Control`, `Expires`, `Set-Cookie`, and `Vary`.
+  Nothing is ignored by default. In particular, ignoring `Set-Cookie` explicitly
+  permits storing and replaying cookies; ignoring `Vary` permits `Vary: *`.
+
+The decision is made when the final response status and headers are available.
+`private`, `no-cache`, or `no-store`, any `Set-Cookie`, and `Vary: *` prevent
+publication. For eligible statuses, `s-maxage` takes precedence over `max-age`,
+then `Expires`, then the configured fallback TTL. Invalid or expired freshness
+values prevent caching. `Age` and `Date` reduce the remaining max-age lifetime.
+Response headers are preserved on both the initial response and cache hits;
+cached responses also account for time on disk in `Age`.
 
 ### Request flow
 
 1. Allows only `GET` and `HEAD`. Bypasses caching when `Authorization` or `Range`
    is present, or the `nocache` query parameter, `nocache` cookie, or `X-NoCache`
-   header equals exactly `1`.
+   header equals exactly `1`. Requests with a body or `Upgrade` also bypass it.
 2. Builds a key from the document root, method, TLS presence, HTTP version, host,
-   original URI including its query, and Authorization. Authorization is empty
-   for requests that qualify for caching.
+   original URI including its query, and a digest of all request headers. Cookies
+   and all header-based `Vary` dimensions are therefore separated **before**
+   singleflight, including on the first miss. This deliberately separates more
+   variants than `Vary` requires; changing irrelevant headers also reduces hits.
+   The configured policy is included so changing overrides does not reuse entries
+   written under the previous policy.
 3. Looks under `caddy.AppDataDir()/proxy_cache/<md5-root>/<md5-key>`. MD5 is used
    for filenames, not encryption or data protection.
 4. On a missing entry, waits for the next middleware's response and uses
-   `singleflight` to coalesce updates of the same key.
+   `singleflight` to coalesce updates of that exact key. Other keys run
+   independently. An uncacheable response belongs only to its initiating request;
+   waiting requests call the next middleware independently rather than sharing it.
 5. On an expired entry, serves the existing copy while updating in the background.
-   New responses are written to a `.tmp` file before replacing the cache entry.
+   The refresh has its own request variables and a context tied to the module,
+   so completing the original request does not cancel it. Concurrent requests
+   keep receiving the previous copy while one refresh runs for their exact key.
+6. Captures the response in a unique temporary file and publishes only after a
+   successful complete body and file close, using rename. A newly uncacheable
+   refresh removes the previous entry. Uncacheable miss responses are still
+   temporarily spooled for their owner, then removed after replay. Incomplete
+   responses and failed refreshes do not replace an existing entry.
+
+Cache metadata includes the response expiry. Older-format entries are refilled.
 
 | Source setting | Value |
 | --- | --- |
-| Response freshness | 300 seconds |
+| Default response freshness | 300 seconds; configurable and overridden by response freshness headers |
 | Maximum wait for a missing entry | 300 seconds, then calls the next middleware directly |
+| Background refresh timeout | 300 seconds |
 | Cleanup interval | 30 seconds after each cleanup pass |
 | File age eligible for cleanup | More than 60 minutes since modification |
 | Cleanup limit | 200 candidate files per pass |
 
 ### Current limitations
 
-- This is not a complete HTTP caching policy. Response status codes are not
-  filtered, and `Cache-Control` or `Expires` do not determine cache eligibility.
-- Cookies other than `nocache` do not separate cache keys, and `Vary` is not
-  handled. Personalized content therefore requires an explicit bypass policy.
-- `Cache-Control`, `Expires`, and `Set-Cookie` are omitted when replaying cached
-  responses, but are still stored on disk with the other response headers.
+- This remains a small response cache, not a complete RFC cache or an Nginx
+  reimplementation. There is no conditional revalidation, purge API, configurable
+  cache key, or general expression language for bypass rules. Existing stale
+  serving remains enabled; `must-revalidate` and request cache directives do not
+  change that behavior.
+- Personalization using information outside the key, such as the peer address,
+  still needs an explicit bypass. Matching cookies alone do not guarantee that
+  content is suitable for caching; the upstream should emit the appropriate
+  response policy.
+- Cleanup still removes files older than one hour, even with longer configured
+  TTLs. Cleanup and filesystem failure recovery remain basic.
 - Cache files include response bodies, metadata, URLs, user agents, and the peer
   address/port (`RemoteAddr`). Debug logs also include Authorization values for
   requests that subsequently bypass the cache. Do not commit real cache or log data.
-- I/O error handling and background operation lifecycle handling are basic.
-  There are no dedicated integration tests at present.
 
 ## Local module: var_file
 
@@ -296,9 +350,16 @@ After building, check the local packages with:
 ./build/go1.27.1/bin/go -C caddy test . github.com/ducktype/caddy_proxy_cache github.com/ducktype/caddy_var_file
 ```
 
-There are currently no `*_test.go` files. This command checks the packages but
-is not a functional test suite. Middleware changes need additional checks for
-real requests, cache misses/hits, bypasses, expiry, concurrency, and errors.
+`caddy_proxy_cache/proxy_cache_test.go` exercises response policy, configuration,
+misses/hits, independent cookie and Vary variants, concurrent fills, private
+responses, stale refresh, bypasses, and incomplete upstream responses through
+in-process HTTP handlers. The other local module has no tests.
+
+For cache concurrency changes, use the race detector on a host with a C compiler:
+
+```bash
+CGO_ENABLED=1 ./build/go1.27.1/bin/go -C caddy test -race github.com/ducktype/caddy_proxy_cache
+```
 
 On Windows, check at least:
 
