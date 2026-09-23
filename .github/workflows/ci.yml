@@ -17,8 +17,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_SHA:0:12}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" ./bin/caddy-linux-amd64 ./bin/caddy-windows-amd64.exe --clobber
-          else
-            gh release create "$tag" ./bin/caddy-linux-amd64 ./bin/caddy-windows-amd64.exe --target "$GITHUB_SHA" --title "$tag" --notes "Linux and Windows x64 binaries."
-          fi
+          gh release create "$tag" ./bin/caddy-linux-amd64 ./bin/caddy-windows-amd64.exe --target "$GITHUB_SHA" ||
+          gh release upload "$tag" ./bin/caddy-linux-amd64 ./bin/caddy-windows-amd64.exe --clobber
