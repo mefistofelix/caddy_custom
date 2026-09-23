@@ -12,7 +12,7 @@ caddy-l4, forwardproxy, caddy-yaml, and two local HTTP middleware modules.
 - `caddy/main.go` registers modules through side-effect imports and delegates
   execution to the Caddy CLI.
 - `caddy_proxy_cache/proxy_cache.go` implements the disk response cache.
-- `caddy_var_file/var_file.go` is a prototype, not a completed feature.
+- `caddy_var_file/var_file.go` loads native request variables from JSON/YAML files.
 - Relative `replace` directives connect both local modules to the main build.
 - There is no frontend, application framework, or Node.js dependency.
 
@@ -146,10 +146,28 @@ into an unrelated middleware rewrite.
 
 ### var_file
 
-The JSON module is `http.handlers.var_file`; the registered Caddyfile directive
-is `vae_file`. It does not read files, sets a fixed placeholder, and does not
-call `next`. Document these as current limitations. Completing or correcting
-them is a behavior change, not part of routine dependency maintenance.
+The JSON module is `http.handlers.var_file`; the directive is `var_file path root`.
+Keep production code in one file, within the user's 100-line limit, using only
+the standard library and libraries/APIs already included by Caddy. Do not restore
+the old `vae_file` typo or add alternative placeholder syntaxes.
+
+Resolve file path placeholders per request. Load once per request by default;
+missing files skip unless `required` is set. Other errors must not silently skip.
+Expose one flat map of leaves via `caddyhttp.SetVar`, including numeric array
+indices, so variables survive proxy-cache request cloning. Use full placeholders
+such as `{http.vars.app.database.host}`: Caddy's vars shorthand cannot expand
+dotted keys. Reject ambiguous object keys, and never mutate cached leaf maps.
+
+Optional `cache`, `stale`, and `max_entries` control fresh lifetime, additional
+stale lifetime and exact LRU capacity. Keep cache state per directive instance,
+coalesce fills per resolved path, and never hold the metadata mutex across I/O or
+decoding. Failed refreshes must not renew deadlines; stale is never indefinite.
+Do not add watchers or cleaner timers. Document that LRU eviction scans the
+bounded entries and that capacity counts files rather than bytes.
+
+Test file formats, nesting, errors, default reloads, snapshots, LRU, stale
+refresh, expiry, independent paths and cancellation. Run var_file tests with
+the race detector for concurrency changes and verify Caddyfile adaptation.
 
 ## Verification and delivery
 

@@ -16,7 +16,7 @@ PHP-FPM, install a system service, or deploy to a server.
 | `caddy/go.mod.initial` | Source of truth for direct dependencies. |
 | `caddy/go.mod`, `caddy/go.sum` | Generated build inputs, ignored by Git. |
 | `caddy_proxy_cache/` | Local disk-backed HTTP response cache. |
-| `caddy_var_file/` | Local experimental middleware; currently incomplete. |
+| `caddy_var_file/` | File-backed request variables with optional decoded-file caching. |
 | `caddy/conf/Caddyfile` | The single checked-in example server configuration. |
 | `.github/workflows/ci.yml` | Manually triggered build and release workflow. |
 | `AGENTS.md` | Project conventions and instructions for coding agents. |
@@ -32,7 +32,7 @@ PHP-FPM, install a system service, or deploy to a server.
 | `caddyserver/forwardproxy` | `v0.0.0-20260321230143-0aab84dad4fc` | HTTP forward proxy. |
 | `abiosoft/caddy-yaml` | `v0.0.0-20210522210701-64fbdd07cf02` | YAML configuration adapter. |
 | `ducktype/caddy_proxy_cache` | Local source | `http.handlers.proxy_cache` middleware. |
-| `ducktype/caddy_var_file` | Local source | `http.handlers.var_file` prototype. |
+| `ducktype/caddy_var_file` | Local source | `http.handlers.var_file` middleware. |
 
 Caddy and the external plugins track the latest upstream default-branch commits
 at update time, including unreleased changes. The branch heads checked on
@@ -454,14 +454,78 @@ same-key waiters. It does not reproduce Nginx's separate upstream/client bufferi
 
 ## Local module: var_file
 
-This is an **incomplete prototype**. Its JSON module ID is
-`http.handlers.var_file`, but its Caddyfile directive is currently registered
-as `vae_file`.
+Registered as `http.handlers.var_file`, with the directive `var_file` (the old
+prototype typo `vae_file` is removed). It loads a file into native Caddy request
+variables and continues to the next handler. The entire production implementation
+is in `caddy_var_file/var_file.go`; it uses the standard library and dependencies
+already included by Caddy, with no new dependency or separate storage service.
 
-It does not read files: it sets `var_file.xxx` to the fixed string `aaaa` and
-returns without calling the next middleware. Path parsing is also unfinished.
-It is compiled into the executable but is not used by the example configuration.
-Do not treat it as a working file-backed variable loader.
+```caddyfile
+var_file "/srv/apps/{vars.site}/settings.json" app
+```
+
+The arguments are **file path, variable root**. Path placeholders resolve once per
+request through Caddy's replacer; unknown or empty placeholders fail. Relative
+paths resolve against the process working directory. Use trusted path variables:
+paths are not confined to the document root. No HTTP `root` variable is required.
+There is no implicit matcher argument; use `handle` or `route` for conditional
+execution. The default directive order is immediately after `root`; use `route`
+when another order is needed, including setting `vars` from loaded values.
+
+Files ending in `.yaml` or `.yml` use the existing YAML decoder; other filenames
+use JSON. A file contains exactly one document/value. JSON numbers retain their
+precision. YAML values must normalize to JSON-compatible data. No templates or
+environment expansion are evaluated inside the file.
+
+For `{"database":{"host":"db.internal"},"servers":[{"port":8080}]}`, the
+variables are `{http.vars.app.database.host}` and `{http.vars.app.servers.0.port}`.
+Array indices start at zero. Use these full placeholder names in both Caddyfile
+and JSON: Caddy's `{vars.name}` shorthand does not expand dotted names.
+
+Decoding produces one flat map of leaf values, reused on cache hits. There is no
+second tree, JSON Pointer syntax, aggregate object placeholder, or duplicate set
+of aliases. Empty objects/arrays produce no leaves; JSON null produces an empty
+placeholder. Object keys must be nonempty and contain no dots or braces, avoiding
+ambiguous nested paths. Each request receives its own variable map, so later
+handlers can overwrite variables without modifying cached snapshots. This also
+preserves loaded values when `proxy_cache` clones request variables for a fill.
+
+By default every request reads and decodes the file. **A missing file skips the
+middleware** and preserves existing variables; other read or decode failures
+return an error before the next handler. Add `required` to fail on missing files.
+
+```caddyfile
+var_file "/srv/apps/{vars.site}/settings.json" app {
+    cache 30s
+    stale 5m
+    max_entries 128
+    # required
+}
+```
+
+- `cache` is the fresh lifetime from successful decoding; default `0` disables
+  caching. Fresh hits perform no filesystem I/O.
+- `stale` is an additional window after freshness expires; default `0`. Within
+  that window requests receive their existing snapshot immediately while one
+  fill per resolved absolute path refreshes in the background. Failures leave the
+  previous snapshot intact but never extend its deadlines. This also means a
+  deleted file may still supply values during its configured stale window.
+- `max_entries` bounds cached decoded files per directive instance; default
+  `128` with caching enabled. Exact LRU updates are constant-time on hits; eviction
+  scans the bounded entries only when a new file exceeds capacity. The limit
+  counts files, not bytes, and no filesystem watcher or cleanup timer runs.
+- `required` is a flag, disabled by default. Once no usable snapshot remains,
+  a missing file errors only when this flag is set. Invalid files always error
+  outside the stale window.
+
+`stale` and `max_entries` require a positive `cache`. Cold or fully expired reads
+coalesce by resolved path; different files load independently. Cancelling a
+waiting request does not cancel a shared fill. Module cancellation prevents new
+cache publication; an already running filesystem read finishes normally.
+Expired entries remain bounded by LRU until replaced or evicted; hits do not
+extend freshness. Update source files by atomic replacement to avoid serving a
+partially written document. The existing example server does not enable this
+middleware automatically.
 
 ## Development checks
 
@@ -476,12 +540,14 @@ After building, check the local packages with:
 misses/hits, independent cookie and Vary variants, concurrent fills, private
 responses, stale refresh, CEL bypass, custom keys and storage, request bodies,
 retention clocks, wait timeouts, and incomplete upstream responses through
-in-process HTTP handlers. The other local module has no tests.
+in-process HTTP handlers. `caddy_var_file/var_file_test.go` covers JSON/YAML,
+nested variables, default reloads, missing/invalid files, snapshots, LRU,
+stale refresh, deadlines, concurrency, cancellation, and Caddyfile adaptation.
 
 For cache concurrency changes, use the race detector on a host with a C compiler:
 
 ```bash
-CGO_ENABLED=1 ./build/go1.27.1/bin/go -C caddy test -race github.com/ducktype/caddy_proxy_cache
+CGO_ENABLED=1 ./build/go1.27.1/bin/go -C caddy test -race github.com/ducktype/caddy_proxy_cache github.com/ducktype/caddy_var_file
 ```
 
 On Windows, check at least:
