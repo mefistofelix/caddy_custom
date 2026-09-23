@@ -27,12 +27,27 @@ PHP-FPM, install a system service, or deploy to a server.
 | Component | Version | Purpose |
 | --- | --- | --- |
 | Go | `1.27.1` | Compiler downloaded by the build script. |
-| Caddy | `v2.11.4` | CLI and standard HTTP, TLS, file server, reverse proxy, and FastCGI modules. |
+| Caddy | `v2.11.5-0.20260921221302-c18099a0af5e` | CLI and standard HTTP, TLS, file server, reverse proxy, and FastCGI modules. |
 | `mholt/caddy-l4` | `v0.1.2` | Layer 4 TCP/UDP connection handling. |
 | `caddyserver/forwardproxy` | `v0.0.0-20260321230143-0aab84dad4fc` | HTTP forward proxy. |
 | `abiosoft/caddy-yaml` | `v0.0.0-20210522210701-64fbdd07cf02` | YAML configuration adapter. |
 | `ducktype/caddy_proxy_cache` | Local source | `http.handlers.proxy_cache` middleware. |
 | `ducktype/caddy_var_file` | Local source | `http.handlers.var_file` prototype. |
+
+Caddy and the external plugins track the latest upstream default-branch commits
+at update time, including unreleased changes. The branch heads checked on
+2026-09-23 are:
+
+| Repository | Branch | Commit |
+| --- | --- | --- |
+| Caddy | `master` | `c18099a0af5e` |
+| caddy-l4 | `master` | `42db5690dea1` (also tagged `v0.1.2`) |
+| forwardproxy | `master` | `0aab84dad4fc` |
+| caddy-yaml | `master` | `64fbdd07cf02` |
+
+The manifest records the Go version identifying each selected commit; it does
+not query a moving branch on every build. A tag may appear when the branch head
+is itself tagged. The older dates on some plugins reflect their current heads.
 
 The local modules use relative `replace` directives. Their `v0.0.0` versions are
 placeholders: the build uses the source directories in this repository.
@@ -88,12 +103,17 @@ Generated `go.mod` and `go.sum` files stay local and must not be committed.
 
 To update components:
 
-1. Check current stable Go, Caddy, and plugin releases.
+1. Check the current Go compiler release and the latest commits on Caddy's and
+   each plugin's default branch (`master` or `main`), including unreleased commits.
 2. Update `go_version` in `build.sh`, the `go` directive in `go.mod.initial` and
    both local modules, and the direct versions in `go.mod.initial`.
 3. Rebuild both targets from the initial manifest and check the affected modules
    and configurations.
 4. Update this README when versions or behavior change.
+
+For Caddy and plugins, resolve the branch or exact commit with Go tooling, such
+as `go list -m -json github.com/caddyserver/caddy/v2@master`. Do not substitute
+`@latest`: it can select a stable tag older than the current branch head.
 
 The generated `go.sum` checks downloaded module integrity, but it is not retained
 in Git. This project intentionally does not keep a complete lock of indirect

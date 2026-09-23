@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/abiosoft/caddy-yaml v0.0.0-20210522210701-64fbdd07cf02
-	github.com/caddyserver/caddy/v2 v2.11.4
+	github.com/caddyserver/caddy/v2 v2.11.5-0.20260921221302-c18099a0af5e
 	github.com/caddyserver/forwardproxy v0.0.0-20260321230143-0aab84dad4fc
 	github.com/ducktype/caddy_proxy_cache v0.0.0
 	github.com/ducktype/caddy_var_file v0.0.0

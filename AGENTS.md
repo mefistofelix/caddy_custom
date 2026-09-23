@@ -38,8 +38,13 @@ caddy-l4, forwardproxy, caddy-yaml, and two local HTTP middleware modules.
 
 ## Updating Go, Caddy, or plugins
 
-- Verify current versions using official sources or Go tooling. Prefer stable
-  releases; modules without releases may use pinned pseudo-versions.
+- For Caddy and external plugins, use the latest commits on their upstream
+  default branches (`master`/`main`), including unreleased changes. Do not use
+  stable-only selection or assume `@latest` means the branch head.
+- Resolve the selected commit to its Go module version and record that version
+  in the initial manifest. A tagged version is acceptable when it identifies
+  the actual branch head. Do not introduce automatic moving-branch updates on
+  every build unless requested. Keep the Go compiler version explicit.
 - Update `go_version` in `build.sh`, the `go` directive in
   `caddy/go.mod.initial`, and both local modules' `go.mod` files.
 - Update direct dependencies in `caddy/go.mod.initial` and the README version table.
