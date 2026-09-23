@@ -294,12 +294,14 @@ cache path, so equal keys in different storage directories do not share a fill.
 For example, an explicit key can use:
 
 ```caddyfile
-key "{http.request.scheme}|{http.request.method}|{http.request.host}|{http.request.orig_uri}|{http.request.header.Cookie}|{http.request.header.Accept-Language}"
+key "{http.request.scheme}|{http.request.method}|{http.request.host}|{http.request.orig_uri}|{http.request.header.Cookie}"
 ```
 
 An explicit key controls the request dimensions: automatic header and body
-digests are no longer appended. Include every relevant cookie, authorization,
-body, and `Vary` dimension yourself. `{http.request.body_hash}` provides the MD5
+digests are no longer appended. Include relevant cookie, authorization, and body
+dimensions unless covered by the upstream's `Vary` response header or bypass
+policy. `Vary` dimensions are discovered automatically as described below.
+`{http.request.body_hash}` provides the MD5
 digest of the buffered request body for key templates. The document-root
 namespace and response/retention policy fingerprint remain separate guards.
 Unknown key placeholders cause an error rather than silently collapsing keys.
@@ -328,7 +330,8 @@ and [`proxy_ignore_headers`](https://nginx.org/en/docs/http/ngx_http_proxy_modul
   cache policy. It does **not** remove headers from the client response or disk.
   Relevant names are `Cache-Control`, `Expires`, `Set-Cookie`, and `Vary`.
   Nothing is ignored by default. In particular, ignoring `Set-Cookie` explicitly
-  permits storing and replaying cookies; ignoring `Vary` permits `Vary: *`.
+  permits storing and replaying cookies; ignoring `Vary` disables automatic
+  variant selection and permits `Vary: *`.
 
 The decision is made when the final response status and headers are available.
 `private`, `no-cache`, or `no-store`, any `Set-Cookie`, and `Vary: *` prevent
@@ -337,6 +340,36 @@ then `Expires`, then the configured fallback TTL. Invalid or expired freshness
 values prevent caching. `Age` and `Date` reduce the remaining max-age lifetime.
 Response headers are preserved on both the initial response and cache hits;
 cached responses also account for time on disk in `Age`.
+
+### Automatic Vary variants
+
+The file at the base key contains a complete response and its `Vary` metadata;
+there is no separate index file. Every lookup starts there. If the request's
+variant hash matches, that response is used. Otherwise the cache opens a secondary
+file named by a hash of the base key and the header names and request values
+selected by `Vary`. Multiple `Vary` fields are combined; header names are matched
+case-insensitively. Spaces and list separators in `Accept-Charset`,
+`Accept-Encoding`, and `Accept-Language` are normalized, following Nginx's approach.
+Other header values are combined in order without semantic normalization.
+
+For example, a custom base key can omit `Accept-Language`: a response with
+`Vary: Accept-Language` then separates Italian and English automatically while
+irrelevant request headers do not fragment that custom key. The default key
+still includes all headers and remains deliberately more conservative.
+
+On a cold base key, requests with that same key wait for its first fill. Each
+waiter then repeats lookup and checks its own variant; it cannot reuse another
+language's response. Once discovered, distinct variants fill and refresh
+independently, with immediate stale serving for the matching variant. The fill
+uses a snapshot of the incoming headers, before downstream handlers can mutate
+them. Uncacheable responses are never shared.
+
+If a secondary response changes or removes `Vary`, its completed response replaces
+the primary file, establishing the new selection rule. Failed fills do not change
+that rule. Metadata survives restarts. If the primary file is removed, discovery
+requires another upstream response even when secondary files remain; ordinary
+retention cleanup eventually removes unused variants. This follows Nginx's storage
+pattern, not its binary format or every HTTP normalization rule.
 
 ### Request flow
 
@@ -352,8 +385,9 @@ cached responses also account for time on disk in `Age`.
    variants than `Vary` requires; changing irrelevant headers also reduces hits.
    The configured policy is included so changing overrides does not reuse entries
    written under the previous policy.
-3. Looks under `<storage_path>/<md5-root>/<md5-key>`. MD5 is used
-   for filenames, not encryption or data protection.
+3. Looks under `<storage_path>/<md5-root>/<md5-key>`, then follows stored `Vary`
+   metadata to a secondary variant when needed. MD5 is used for filenames, not
+   encryption or data protection. A variant is checked before serving it stale.
 4. On a missing entry, waits for the next middleware's response and uses
    `singleflight` to coalesce updates of that exact cache path. Other keys run
    independently. An uncacheable response belongs only to its initiating request;
@@ -368,8 +402,8 @@ cached responses also account for time on disk in `Age`.
    temporarily spooled for their owner, then removed after replay. Incomplete
    responses and failed refreshes do not replace an existing entry.
 
-Cache metadata includes response expiry, creation time, and both retention
-durations. Older-format entries are refilled. After timeout or cancellation,
+Cache metadata includes response expiry, creation time, both retention
+durations, `Vary`, and a variant hash. Older-format entries are refilled. After timeout or cancellation,
 an abandoned private fill is removed when the producer finishes.
 
 | Source setting | Value |

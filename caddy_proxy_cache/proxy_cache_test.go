@@ -220,6 +220,239 @@ func TestPerVariantSingleflight(t *testing.T) {
 	}
 }
 
+func TestAutomaticVaryColdSingleflight(t *testing.T) {
+	m := newTestCache(t)
+	m.Key = "shared"
+	var calls atomic.Int32
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header().Add("Vary", "Accept-Language")
+		w.Header().Add("Vary", "Accept-Encoding")
+		w.WriteHeader(200)
+		time.Sleep(10 * time.Millisecond)
+		_, err := io.WriteString(w, r.Header.Get("Accept-Language")+"/"+r.Header.Get("Accept-Encoding"))
+		return err
+	})
+	results := make(chan error, 24)
+	for i := range 24 {
+		go func() {
+			lang, encoding := []string{"it", "en"}[i%2], []string{"gzip", "br"}[i/2%2]
+			h := http.Header{"Accept-Language": {lang}, "Accept-Encoding": {encoding}, "X-Unrelated": {strconv.Itoa(i)}}
+			w, err := perform(m, request(h), next)
+			if err == nil && (w.Body.String() != lang+"/"+encoding || len(w.Header().Values("Vary")) != 2) {
+				err = fmt.Errorf("wrong variant: %s %v", w.Body.String(), w.Header())
+			}
+			results <- err
+		}()
+	}
+	for range 24 {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("variant fill blocked")
+		}
+	}
+	if calls.Load() != 4 || len(files(t, m)) != 4 {
+		t.Fatalf("calls=%d files=%v", calls.Load(), files(t, m))
+	}
+	// Restarting needs no in-memory Vary index.
+	x := newTestCache(t)
+	x.Key, x.cache_dir = m.Key, m.cache_dir
+	for _, lang := range []string{"it", "en"} {
+		for _, encoding := range []string{"gzip", "br"} {
+			w, err := perform(x, request(http.Header{"Accept-Language": {lang}, "Accept-Encoding": {encoding}}), next)
+			if err != nil || w.Body.String() != lang+"/"+encoding {
+				t.Fatalf("restart hit: %s %v", w.Body.String(), err)
+			}
+		}
+	}
+	if calls.Load() != 4 {
+		t.Fatal("variants missed after restart")
+	}
+}
+
+func TestAutomaticVaryNormalizationAndPolicyChanges(t *testing.T) {
+	m := newTestCache(t)
+	m.Key = "shared"
+	calls := 0
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls++
+		switch calls {
+		case 1:
+			w.Header().Set("Vary", "aCcEpT-LaNgUaGe")
+			io.WriteString(w, "languages")
+		case 2:
+			w.Header().Set("Vary", "Accept-Encoding")
+			io.WriteString(w, "gzip")
+		case 3:
+			io.WriteString(w, "common")
+		default:
+			return errors.New("unexpected miss")
+		}
+		return nil
+	})
+	for _, tc := range []struct {
+		h     http.Header
+		body  string
+		calls int
+	}{
+		{http.Header{"Accept-Language": {"en, fr"}}, "languages", 1},
+		{http.Header{"Accept-Language": {"en", "fr"}}, "languages", 1},
+		{http.Header{"Accept-Language": {"it"}, "Accept-Encoding": {"gzip"}}, "gzip", 2},
+		{http.Header{"Accept-Language": {"de"}, "Accept-Encoding": {"gzip"}}, "gzip", 2},
+		{http.Header{"Accept-Encoding": {"br"}}, "common", 3},
+		{nil, "common", 3},
+	} {
+		w, err := perform(m, request(tc.h), next)
+		if err != nil || w.Body.String() != tc.body || calls != tc.calls {
+			t.Fatalf("body=%s calls=%d err=%v", w.Body.String(), calls, err)
+		}
+	}
+	// Ignoring Vary retains the response header but disables its key dimensions.
+	m = newTestCache(t)
+	m.Key, m.IgnoreHeaders = "shared", []string{"Vary"}
+	count := 0
+	ignored := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error { count++; w.Header().Set("Vary", "*"); return nil })
+	for _, lang := range []string{"it", "en"} {
+		w, err := perform(m, request(http.Header{"Accept-Language": {lang}}), ignored)
+		if err != nil || w.Header().Get("Vary") != "*" {
+			t.Fatalf("ignored Vary: %v %v", w.Header(), err)
+		}
+	}
+	if count != 1 {
+		t.Fatal("ignored Vary still split keys")
+	}
+}
+
+func TestAutomaticVaryParallelStaleRefresh(t *testing.T) {
+	m := newTestCache(t)
+	m.Key = "shared"
+	first := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Vary", "Accept-Language")
+		_, err := io.WriteString(w, "old-"+r.Header.Get("Accept-Language"))
+		return err
+	})
+	for _, lang := range []string{"it", "en"} {
+		if _, err := perform(m, request(http.Header{"Accept-Language": {lang}}), first); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range files(t, m) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, suffix, _ := strings.Cut(string(data), " ")
+		if err := os.WriteFile(path, []byte(strconv.FormatInt(time.Now().Add(-time.Second).Unix(), 10)+" "+suffix), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started, release := make(chan string, 2), make(chan struct{})
+	var calls atomic.Int32
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		lang := r.Header.Get("Accept-Language")
+		started <- lang
+		<-release
+		w.Header().Set("Vary", "Accept-Language")
+		_, err := io.WriteString(w, "new-"+lang)
+		return err
+	})
+	for i := range 12 {
+		lang := []string{"it", "en"}[i%2]
+		w, err := perform(m, request(http.Header{"Accept-Language": {lang}}), next)
+		if err != nil || w.Body.String() != "old-"+lang {
+			close(release)
+			t.Fatalf("stale %s: %s %v", lang, w.Body.String(), err)
+		}
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			close(release)
+			t.Fatal("variant refreshes serialized")
+		}
+	}
+	if calls.Load() != 2 {
+		close(release)
+		t.Fatalf("refresh calls=%d", calls.Load())
+	}
+	close(release)
+	for _, lang := range []string{"it", "en"} {
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			w, err := perform(m, request(http.Header{"Accept-Language": {lang}}), next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w.Body.String() == "new-"+lang {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("variant refresh not published")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestAutomaticVaryFailedSecondaryFill(t *testing.T) {
+	for _, mode := range []string{"private", "wildcard", "upstream-error", "filesystem"} {
+		t.Run(mode, func(t *testing.T) {
+			m := newTestCache(t)
+			m.Key = "shared"
+			first := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.Header().Set("Vary", "Accept-Language")
+				_, err := io.WriteString(w, "italian")
+				return err
+			})
+			if _, err := perform(m, request(http.Header{"Accept-Language": {"it"}}), first); err != nil {
+				t.Fatal(err)
+			}
+			main := files(t, m)[0]
+			if mode == "filesystem" {
+				path := filepath.Join(filepath.Dir(main), cacheVariant(filepath.Base(main), "Accept-Language", http.Header{"Accept-Language": {"en"}}))
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.Header().Set("Vary", "Accept-Language")
+				if mode == "private" {
+					w.Header().Set("Set-Cookie", "user=1")
+				}
+				if mode == "wildcard" {
+					w.Header().Set("Vary", "*")
+				}
+				io.WriteString(w, "english")
+				if mode == "upstream-error" {
+					return errors.New("upstream failed")
+				}
+				return nil
+			})
+			w, err := perform(m, request(http.Header{"Accept-Language": {"en"}}), next)
+			if mode == "upstream-error" || mode == "filesystem" {
+				if err == nil {
+					t.Fatal("expected fill failure")
+				}
+			} else if err != nil || w.Body.String() != "english" {
+				t.Fatalf("private response: %s %v", w.Body.String(), err)
+			}
+			if len(files(t, m)) != 1 {
+				t.Fatal("failed or private variant published")
+			}
+			w, err = perform(m, request(http.Header{"Accept-Language": {"it"}}), next)
+			if err != nil || w.Body.String() != "italian" {
+				t.Fatalf("primary damaged: %s %v", w.Body.String(), err)
+			}
+		})
+	}
+}
+
 func TestConfiguredFreshness(t *testing.T) {
 	for _, tc := range []struct {
 		config  string

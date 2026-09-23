@@ -94,7 +94,13 @@ variable, and coalesces cache updates with `singleflight` per complete cache key
 Preserve that granularity and immediate stale serving during background refresh.
 By default, all request headers and the body contribute to the key before
 coalescing. An explicit placeholder key replaces these request dimensions;
-document the caller's responsibility for cookie, authorization, and Vary variants.
+document the caller's responsibility for cookie, authorization, and body dimensions
+not covered by upstream `Vary` or bypass. Automatic `Vary` uses the primary response
+as the on-disk entry point and derived keys for secondary variants. Recheck each
+waiter's variant after a fill; never share a mismatched response, including stale
+entries. Preserve incoming header snapshots, per-variant singleflight, and complete
+publication when `Vary` changes or disappears. `ignore_headers Vary` disables this
+selection. Keep metadata in the response file; do not add a separate index service.
 Keep the document-root namespace and policy fingerprint. Coalesce by the full
 cache path, so identical template values in separate roots do not share a fill.
 Resolve `storage_path` request placeholders before lookup without mutating shared
