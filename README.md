@@ -388,10 +388,12 @@ pattern, not its binary format or every HTTP normalization rule.
 3. Looks under `<storage_path>/<md5-root>/<md5-key>`, then follows stored `Vary`
    metadata to a secondary variant when needed. MD5 is used for filenames, not
    encryption or data protection. A variant is checked before serving it stale.
-4. On a missing entry, waits for the next middleware's response and uses
-   `singleflight` to coalesce updates of that exact cache path. Other keys run
-   independently. An uncacheable response belongs only to its initiating request;
-   waiting requests call the next middleware independently rather than sharing it.
+4. On a missing entry, the initiating request receives headers and body as the
+   upstream produces them. Cacheable body chunks are also written to the private
+   temporary file. `singleflight` coalesces updates of that exact cache path:
+   waiters receive only a completed, published response, after checking their own
+   `Vary` dimensions. Other keys run independently. An uncacheable response belongs
+   only to its initiating request; waiters obtain their own upstream responses.
 5. On an expired entry, serves the existing copy while updating in the background.
    The refresh has its own request variables and a context tied to the module,
    so completing the original request does not cancel it. Concurrent requests
@@ -399,25 +401,34 @@ pattern, not its binary format or every HTTP normalization rule.
 6. Keeps response headers in memory until the final status, then decides where
    the body goes. A cacheable response creates a unique temporary file and is
    published only after a successful complete body and file close, using rename.
-   A response rejected by header policy streams to its initiating request through
-   an unbuffered pipe, with no response file and no whole-body memory buffer.
+   All miss responses stream to their initiating request through an unbuffered
+   pipe, with headers and body chunks flushed to the client. Header-rejected
+   responses create no file; neither path buffers the whole body in memory.
    The request goroutine alone writes to its client; timeout or cancellation closes
    the pipe so an abandoned producer cannot write to that client later. Waiting
-   requests obtain their own upstream responses, including if the private stream
+   requests obtain their own upstream responses, including if the initiating stream
    fails. Background refreshes discard uncacheable bodies and remove the previous
    entry only after successful completion. Incomplete responses and failed
    refreshes do not replace an existing entry.
 
 Cache metadata includes response expiry, creation time, both retention
 durations, `Vary`, and a variant hash. Older-format entries are refilled. A response
-accepted at headers can still exceed `max_age` during capture: its existing
-temporary file is then replayed only to its owner and removed, without publication.
-Abandoned captures are cleaned up when the producer finishes.
+accepted at headers can still exceed `max_age` during capture: the initiating
+client receives its stream, but the temporary file is removed without publication.
+Abandoned captures are cleaned up when the producer finishes. After headers have
+been sent, a failed upstream or capture can leave the initiating client with a
+partial response; that response is never published for waiters.
+
+This matches Nginx's basic miss behavior with `proxy_cache_lock on`: the first
+client streams while equal-key waiters await publication. It is not a broadcast
+of an unfinished body to all waiters. The small implementation uses synchronous
+disk writes and an unbuffered pipe: a slow initiating client can slow its fill and
+same-key waiters. It does not reproduce Nginx's separate upstream/client buffering.
 
 | Source setting | Value |
 | --- | --- |
 | Default response freshness | 300 seconds; configurable and overridden by response freshness headers |
-| Maximum wait for a missing entry | `wait_timeout`, then calls the next middleware directly without caching that fallback. Once an uncacheable response starts streaming, its lifetime follows the request context instead. |
+| Maximum wait for a missing entry | `wait_timeout`, then calls the next middleware directly without caching that fallback. Once the initiating response starts streaming, its lifetime follows the request context instead. |
 | Background refresh timeout | `wait_timeout` |
 | Cleanup interval | 30 seconds; stops when the module is cleaned up |
 | File age eligible for cleanup | Either enabled retention limit has expired; abandoned temporary files older than one hour are also removed |

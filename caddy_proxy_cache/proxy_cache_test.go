@@ -1096,73 +1096,207 @@ func TestUncacheableStreamsWithoutDisk(t *testing.T) {
 	}
 }
 
-func TestPrivateStreamCancellationDoesNotFailWaiters(t *testing.T) {
+func TestStreamCancellationDoesNotFailWaiters(t *testing.T) {
+	for _, private := range []bool{false, true} {
+		t.Run(fmt.Sprintf("private=%t", private), func(t *testing.T) {
+			m := newTestCache(t)
+			var calls atomic.Int32
+			producerDone := make(chan error, 1)
+			late := make(chan struct{})
+			releaseLate := sync.OnceFunc(func() { close(late) })
+			defer releaseLate()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				id := calls.Add(1)
+				w.Header().Set("X-User", fmt.Sprintf("user=%d", id))
+				if private {
+					w.Header().Set("Set-Cookie", fmt.Sprintf("user=%d", id))
+				}
+				_, err := fmt.Fprintf(w, "user=%d", id)
+				if id == 1 {
+					<-r.Context().Done()
+					<-late
+					_, err = io.WriteString(w, "after-cancel")
+					producerDone <- err
+				}
+				return err
+			})
+			r := request(nil)
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			w := &observedResponse{httptest.NewRecorder(), make(chan struct{}, 1)}
+			done := make(chan error, 1)
+			go func() { done <- m.ServeHTTP(w, r.WithContext(ctx), next) }()
+			select {
+			case <-w.written:
+			case <-time.After(3 * time.Second):
+				t.Fatal("owner stream not started")
+			}
+			waiter := make(chan error, 1)
+			go func() {
+				w, err := perform(m, request(nil), next)
+				if err == nil && (w.Body.String() != "user=2" || w.Header().Get("X-User") != "user=2") {
+					err = fmt.Errorf("waiter received %s", w.Body.String())
+				}
+				waiter <- err
+			}()
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("cancelled stream succeeded")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("cancelled reader blocked")
+			}
+			releaseLate()
+			select {
+			case err := <-producerDone:
+				if err == nil {
+					t.Fatal("producer wrote after cancellation")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("producer blocked")
+			}
+			select {
+			case err := <-waiter:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("waiter blocked")
+			}
+			if w.Body.String() != "user=1" {
+				t.Fatal("late client write")
+			}
+			for _, path := range files(t, m) {
+				data, err := os.ReadFile(path)
+				if private || err != nil || strings.HasPrefix(filepath.Base(path), ".response-") || !strings.HasSuffix(string(data), "user=2") {
+					t.Fatalf("incomplete owner response retained: %s %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCacheableMissStreamsOverHTTPAndCoalescesWaiters(t *testing.T) {
 	m := newTestCache(t)
-	var calls atomic.Int32
-	producerDone := make(chan error, 1)
-	late := make(chan struct{})
-	releaseLate := sync.OnceFunc(func() { close(late) })
-	defer releaseLate()
+	m.Key = "{http.request.uri.path}"
+	release := make(chan struct{})
+	releaseBody := sync.OnceFunc(func() { close(release) })
+	var fills atomic.Int32
 	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		id := calls.Add(1)
-		w.Header().Set("Set-Cookie", fmt.Sprintf("user=%d", id))
-		_, err := fmt.Fprintf(w, "user=%d", id)
-		if id == 1 {
-			<-r.Context().Done()
-			<-late
-			_, err = io.WriteString(w, "after-cancel")
-			producerDone <- err
+		if r.URL.Path != "/slow" {
+			_, err := io.WriteString(w, "independent")
+			return err
 		}
+		fills.Add(1)
+		w.Header().Set("X-Origin", "slow")
+		if _, err := io.WriteString(w, "first-"); err != nil {
+			return err
+		}
+		<-release
+		_, err := io.WriteString(w, "last")
 		return err
 	})
-	r := request(nil)
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	w := &observedResponse{httptest.NewRecorder(), make(chan struct{}, 1)}
-	done := make(chan error, 1)
-	go func() { done <- m.ServeHTTP(w, r.WithContext(ctx), next) }()
-	select {
-	case <-w.written:
-	case <-time.After(3 * time.Second):
-		t.Fatal("owner stream not started")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w = caddyhttp.NewResponseRecorder(w, nil, nil)
+		r = caddyhttp.PrepareRequest(r, caddy.NewReplacer(), w, nil)
+		caddyhttp.SetVar(r.Context(), "root", "/test/public")
+		if err := m.ServeHTTP(w, r, next); err != nil {
+			panic(http.ErrAbortHandler)
+		}
+	}))
+	defer server.Close()
+	defer releaseBody()
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	response, err := client.Get(server.URL + "/slow")
+	if err != nil {
+		t.Fatalf("headers delayed until full body: %v", err)
 	}
-	waiter := make(chan error, 1)
+	defer response.Body.Close()
+	chunk := make([]byte, len("first-"))
+	if _, err := io.ReadFull(response.Body, chunk); err != nil || string(chunk) != "first-" {
+		t.Fatalf("first chunk: %q %v", chunk, err)
+	}
+	paths := files(t, m)
+	if len(paths) != 1 || !strings.HasPrefix(filepath.Base(paths[0]), ".response-") {
+		t.Fatalf("published before completion: %v", paths)
+	}
+	follower := make(chan error, 1)
 	go func() {
-		w, err := perform(m, request(nil), next)
-		if err == nil && (w.Body.String() != "user=2" || w.Header().Get("Set-Cookie") != "user=2") {
-			err = fmt.Errorf("waiter received %s", w.Body.String())
+		res, err := client.Get(server.URL + "/slow")
+		if err == nil {
+			defer res.Body.Close()
+			data, readErr := io.ReadAll(res.Body)
+			err = readErr
+			if err == nil && (string(data) != "first-last" || res.Header.Get("X-Origin") != "slow") {
+				err = fmt.Errorf("waiter response: %s %v", data, res.Header)
+			}
 		}
-		waiter <- err
+		follower <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("cancelled stream succeeded")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("cancelled reader blocked")
+	other, err := client.Get(server.URL + "/other")
+	if err != nil {
+		t.Fatalf("other key blocked: %v", err)
 	}
-	releaseLate()
-	select {
-	case err := <-producerDone:
-		if err == nil {
-			t.Fatal("producer wrote after cancellation")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("producer blocked")
+	data, err := io.ReadAll(other.Body)
+	other.Body.Close()
+	if err != nil || string(data) != "independent" {
+		t.Fatalf("other key: %q %v", data, err)
 	}
 	select {
-	case err := <-waiter:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("waiter blocked")
+	case err := <-follower:
+		t.Fatalf("waiter saw incomplete fill: %v", err)
+	case <-time.After(30 * time.Millisecond):
 	}
-	if w.Body.String() != "user=1" || len(files(t, m)) != 0 {
-		t.Fatal("late write or disk spill")
+	releaseBody()
+	data, err = io.ReadAll(response.Body)
+	if err != nil || string(data) != "last" {
+		t.Fatalf("owner tail: %q %v", data, err)
+	}
+	if err := <-follower; err != nil {
+		t.Fatal(err)
+	}
+	if fills.Load() != 1 {
+		t.Fatalf("fills=%d", fills.Load())
+	}
+	for _, path := range files(t, m) {
+		if strings.HasPrefix(filepath.Base(path), ".response-") {
+			t.Fatal("temporary fill leaked")
+		}
+	}
+}
+
+func TestStreamBeyondRetentionIsNotPublished(t *testing.T) {
+	m := newTestCache(t)
+	age := caddy.Duration(time.Millisecond)
+	m.MaxAge = &age
+	w, err := perform(m, request(nil), caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		_, err := io.WriteString(w, "complete response")
+		time.Sleep(5 * time.Millisecond)
+		return err
+	}))
+	if err != nil || w.Body.String() != "complete response" || len(files(t, m)) != 0 {
+		t.Fatalf("late expiry: body=%q files=%v err=%v", w.Body.String(), files(t, m), err)
+	}
+}
+
+func TestCacheStorageFailureDoesNotRepeatOrigin(t *testing.T) {
+	m := newTestCache(t)
+	m.cache_dir = filepath.Join(m.cache_dir, "not-a-directory")
+	if err := os.WriteFile(m.cache_dir, []byte("blocked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	_, err := perform(m, request(nil), caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls++
+		_, err := io.WriteString(w, "cacheable")
+		return err
+	}))
+	if err == nil || calls != 1 {
+		t.Fatalf("origin calls=%d err=%v", calls, err)
 	}
 }
 

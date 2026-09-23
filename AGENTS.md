@@ -118,18 +118,22 @@ once and use independent readers for fills and fallbacks.
 `ignore_headers` overrides response policy, never removes headers. Policy is evaluated
 at final headers; only a complete successful response is published. Uncacheable
 responses must not be shared among waiting requests. Create response files only
-after final headers approve caching. Stream header-rejected responses to their
-owner without disk or whole-body buffering; only the request goroutine may write
-to its client. Close private pipes on timeout/cancellation and do not propagate
-their failures to waiting clients. Preserve response headers and isolate
-background request state from the original request.
+after final headers approve caching. Stream all miss responses to their owner
+while capturing eligible bodies; header-rejected responses never touch disk.
+Only the request goroutine may write to its client. Flush outgoing stream chunks
+through `http.ResponseController` so Caddy's wrappers are respected,
+close pipes on timeout/cancellation, and keep waiters on complete published files.
+Owner stream failures must not be inherited by waiting clients. Preserve response
+headers and isolate background request state from the original request. Keep the
+bounded-memory backpressure tradeoff documented; do not imply Nginx's buffering
+architecture or broadcast incomplete bodies to waiters.
 
 Keep freshness separate from retention. Mtime tracks last access only when
 `inactive` is enabled. Immutable creation time and stored durations enforce
 `max_age` and keep `Age` independent of touches. Enforce both retention limits
 on lookup and cleanup, including for stale entries. Stop the cleaner with the
 module context; do not leave timers running after cleanup. Temporary files stay
-on the cache filesystem and abandoned private fills must be removed.
+on the cache filesystem and abandoned fills must be removed.
 
 The README describes the implemented policy and remaining limitations; do not
 imply complete RFC or Nginx compatibility. Nginx is a reference for relevant
