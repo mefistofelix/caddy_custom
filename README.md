@@ -260,7 +260,7 @@ below; these settings are not all required.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `methods METHOD ...` | `GET HEAD` | Exact, case-sensitive allowlist; replaces the default list. |
-| `storage_path path` | `caddy.AppDataDir()/proxy_cache` | Dedicated cache directory for this middleware instance. Relative paths resolve from the process working directory; global placeholders such as `{env.CACHE_DIR}` are resolved at provisioning. Request placeholders are not supported here. Temporary files stay beside the final entry for rename. |
+| `storage_path path` | `caddy.AppDataDir()/proxy_cache` | Dedicated cache directory, supporting request placeholders such as `{http.request.host}` and `{http.vars.root_name}`. Global placeholders such as `{env.CACHE_DIR}` resolve at provisioning; request placeholders resolve before cache lookup. Relative paths resolve from the process working directory. Temporary files stay beside the final entry for rename. |
 | `key template` | Built-in key described below | Request-time Caddy placeholder template, replacing the default key. |
 | `bypass expression` | Authorization present or any implemented `nocache` signal exactly `1` | Caddy CEL request matcher, compiled at provisioning. `true` skips both reading and writing the cache. An explicit expression replaces this default bypass policy. |
 | `inactive duration` | `0` (disabled) | Retention limit since the last cache access, tracked using file modification time. |
@@ -274,6 +274,22 @@ enabled `inactive` causes cache reads to update mtime. Creation time and policy
 durations are stored in the file, so touching it cannot extend `max_age`, change
 response freshness, or reset `Age`. Entries sharing a storage directory retain
 their own stored limits when another middleware instance runs cleanup.
+
+For storage separated by application and virtual host:
+
+```caddyfile
+storage_path "/var/cache/caddy/{vars.root_name}/{host}"
+```
+
+Set `root_name` before `proxy_cache`, as in the checked-in Caddyfile. A variable
+may also contain an absolute directory: `storage_path "{vars.cache_dir}"`.
+Unknown or empty path placeholders fail the request before accessing the cache.
+Use trusted path variables; values are filesystem paths, not sanitized identifiers.
+The cleaner tracks resolved directories concurrently. After a reload or restart,
+a dynamic directory is registered again on its first eligible request; dormant
+directories are not swept until then. Retention is always checked on lookup.
+The document-root namespace remains, and singleflight uses the complete resolved
+cache path, so equal keys in different storage directories do not share a fill.
 
 For example, an explicit key can use:
 

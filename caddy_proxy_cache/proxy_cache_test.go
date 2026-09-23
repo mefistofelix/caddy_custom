@@ -465,6 +465,115 @@ func TestFinalHeadersAndBypass(t *testing.T) {
 	}
 }
 
+func TestDynamicStoragePaths(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	base := t.TempDir()
+	t.Setenv("CACHE_TEST_DIR", base)
+	m := newTestCache(t)
+	m.StoragePath = "{env.CACHE_TEST_DIR}/{http.vars.root_name}/{http.request.host}"
+	m.Key, m.Inactive = "same-key", caddy.Duration(time.Hour)
+	if err := m.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Cleanup()
+	started, release := make(chan struct{}, 4), make(chan struct{})
+	defer close(release)
+	var calls atomic.Int32
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return r.Context().Err()
+		}
+		_, err := fmt.Fprintf(w, "%s/%s", caddyhttp.GetVar(r.Context(), "root_name"), r.Host)
+		return err
+	})
+	makeRequest := func(app, host string) *http.Request {
+		r := request(nil)
+		r.Host = host
+		caddyhttp.SetVar(r.Context(), "root_name", app)
+		return r
+	}
+	results := make(chan error, 4)
+	for _, app := range []string{"app-a", "app-b"} {
+		for _, host := range []string{"a.test", "b.test"} {
+			go func() {
+				w, err := perform(m, makeRequest(app, host), next)
+				if err == nil && w.Body.String() != app+"/"+host {
+					err = fmt.Errorf("mixed storage: %q", w.Body.String())
+				}
+				results <- err
+			}()
+		}
+	}
+	for range 4 {
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("different storage paths shared a fill")
+		}
+	}
+	// All four fills must reach the upstream before any one of them completes.
+	for range 4 {
+		release <- struct{}{}
+	}
+	for range 4 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, app := range []string{"app-a", "app-b"} {
+		for _, host := range []string{"a.test", "b.test"} {
+			w, err := perform(m, makeRequest(app, host), next)
+			if err != nil || w.Body.String() != app+"/"+host {
+				t.Fatalf("hit: %q %v", w.Body.String(), err)
+			}
+			entries, err := filepath.Glob(filepath.Join(base, app, host, U.Md5("/test/public"), "*"))
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("entries: %v %v", entries, err)
+			}
+			old := time.Now().Add(-2 * time.Hour)
+			if err := os.Chtimes(entries[0], old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("upstream calls: %d", calls.Load())
+	}
+	m.cleanCache()
+	check := newTestCache(t)
+	check.cache_dir = base
+	if paths := files(t, check); len(paths) != 0 {
+		t.Fatalf("dynamic cleanup left files: %v", paths)
+	}
+
+	for _, value := range []string{"", "missing", base} {
+		x := newTestCache(t)
+		x.cache_dir = "{http.vars.cache_dir}"
+		r := request(nil)
+		if value != "missing" {
+			caddyhttp.SetVar(r.Context(), "cache_dir", value)
+		}
+		var reached bool
+		_, err := perform(x, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			reached = true
+			_, err := io.WriteString(w, "absolute path")
+			return err
+		}))
+		if value == base {
+			if err != nil || !reached || len(files(t, check)) != 1 {
+				t.Fatalf("absolute variable path: %v", err)
+			}
+		} else if err == nil || reached {
+			t.Fatalf("accepted empty or unknown storage variable: %q", value)
+		}
+	}
+}
+
 func TestStorageAndCELConfiguration(t *testing.T) {
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()

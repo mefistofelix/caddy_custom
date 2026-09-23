@@ -97,6 +97,9 @@ coalescing. An explicit placeholder key replaces these request dimensions;
 document the caller's responsibility for cookie, authorization, and Vary variants.
 Keep the document-root namespace and policy fingerprint. Coalesce by the full
 cache path, so identical template values in separate roots do not share a fill.
+Resolve `storage_path` request placeholders before lookup without mutating shared
+configuration. Track resolved directories safely for cleanup; dynamic paths are
+rediscovered on their first eligible request after reload or restart.
 
 Keep the production implementation minimal and in its existing single file.
 The supported options are `methods`, `storage_path`, `key`, `bypass` (Caddy CEL),

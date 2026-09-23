@@ -6,7 +6,7 @@ import "io/fs"
 //import "io/ioutil"
 import "slices"
 import "fmt"
-//import "sync"
+import "sync"
 import "crypto/md5"
 import "encoding/hex"
 import "path/filepath"
@@ -187,6 +187,7 @@ type ProxyCache struct {
 	logger *zap.Logger
 	sfg *singleflight.Group
 	cache_dir string
+	storageDirs *sync.Map
 	cancel context.CancelFunc
 }
 
@@ -205,6 +206,7 @@ func (s cacheStamp) retained(info fs.FileInfo) bool {
 func NewProxyCache() *ProxyCache {
 	m := new(ProxyCache)
 	m.sfg = new(singleflight.Group)
+	m.storageDirs = new(sync.Map)
 	//m.ReadyLockMap = xsync.NewMapOf[string, string]()
 	return m
 }
@@ -233,8 +235,9 @@ func (m *ProxyCache) Provision(ctx caddy.Context) error {
 	if m.Inactive < 0 || (m.MaxAge != nil && *m.MaxAge < 0) || (m.WaitTimeout != nil && *m.WaitTimeout <= 0) { return fmt.Errorf("TTL must be non-negative and wait_timeout positive") }
 	if m.Bypass != nil { if err := m.Bypass.Provision(ctx); err != nil { return err } }
 	path := m.StoragePath; if path == "" { path = filepath.Join(caddy.AppDataDir(),"proxy_cache") }
-	var err error; path, err = caddy.NewReplacer().ReplaceOrErr(path, true, true); if err != nil { return err }
-	m.cache_dir, err = filepath.Abs(path); if err != nil { return err }
+	var err error; path, err = caddy.NewReplacer().ReplaceOrErr(path, true, false); if err != nil { return err }
+	m.cache_dir = path
+	if !strings.Contains(path, "{") { m.cache_dir, err = filepath.Abs(path); if err != nil { return err } }
 	//os.MkdirAll(m.cache_dir, 0644) //@error handling
 	go func() { ticker := time.NewTicker(30*time.Second); defer ticker.Stop(); for { m.cleanCache(); select { case <-m.ctx.Done(): return; case <-ticker.C: } } }()
 	return nil
@@ -252,7 +255,9 @@ func (m *ProxyCache) cleanCache() {
 	var max_files_delete = 200
 	
 	var num_del = 0
-	filepath.WalkDir(m.cache_dir, func (s string, f fs.DirEntry, err error) error {
+	if !strings.Contains(m.cache_dir, "{") { m.storageDirs.Store(m.cache_dir, true) }
+	m.storageDirs.Range(func(path, _ any) bool {
+	filepath.WalkDir(path.(string), func (s string, f fs.DirEntry, err error) error {
 		if err != nil {
 		  return nil
 		}
@@ -275,6 +280,8 @@ func (m *ProxyCache) cleanCache() {
 			return fs.SkipAll
 		}
 		return nil
+	})
+	return num_del < max_files_delete
 	})
 	
 }
@@ -383,7 +390,10 @@ func (m ProxyCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
   if m.Key != "" { var err error; cache_key, err = repl.ReplaceOrErr(m.Key, false, true); if err != nil { return err } }
   cache_key += fmt.Sprintf(" policy: %#v/%q/%d/%d", m.Valid, m.IgnoreHeaders, max_retention, m.Inactive)
   var cache_key_md5 = U.Md5(cache_key)
-  var cache_dir = filepath.Join(m.cache_dir,docroot_md5)
+  storage, err := repl.ReplaceOrErr(m.cache_dir, true, true); if err != nil { return err }
+  storage, err = filepath.Abs(storage); if err != nil { return err }
+  m.storageDirs.Store(storage, true)
+  var cache_dir = filepath.Join(storage,docroot_md5)
   var cache_path = filepath.Join(cache_dir,cache_key_md5)
   
 	log.Debugln("nocache_arg_name: ",nocache_arg_name)
